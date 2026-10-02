@@ -550,6 +550,23 @@ BOOL WINAPI GetPointerFrameInfoHistory( UINT32 id, UINT32 *entries, UINT32 *poin
     return NtUserGetPointerInfoList( id, PT_POINTER, 0, 0, sizeof(*info), entries, pointers, info );
 }
 
+/**********************************************************************
+ *		GetProcessUIContextInformation (USER32.@)
+ */
+BOOL WINAPI GetProcessUIContextInformation( HANDLE process, PROCESS_UICONTEXT_INFORMATION *info )
+{
+    FIXME( "process %p, info %p semi-stub\n", process, info );
+
+    if (!info)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    info->processUIContext = PROCESS_UICONTEXT_DESKTOP;
+    info->flags = 0;
+    return TRUE;
+}
+
 LRESULT WINAPI ImeWndProcA( HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam )
 {
     if (!imm_ime_wnd_proc) return DefWindowProcA(hwnd, msg, wParam, lParam);
