@@ -1556,6 +1556,15 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *le
 }
 
 /***********************************************************************
+ *         GetApplicationUserModelId   (kernelbase.@)
+ */
+LONG WINAPI /* DECLSPEC_HOTPATCH */ GetApplicationUserModelId( HANDLE process, UINT32 *length, WCHAR *id )
+{
+    FIXME( "(%p %p %p): stub\n", process, length, id );
+    return APPMODEL_ERROR_NO_APPLICATION;
+}
+
+/***********************************************************************
  *         GetCurrentPackageFamilyName   (kernelbase.@)
  */
 LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length, WCHAR *name )

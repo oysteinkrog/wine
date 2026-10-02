@@ -425,7 +425,7 @@
 # @ stub GetAppModelVersion
 # @ stub GetApplicationRecoveryCallback
 @ stdcall GetApplicationRestartSettings(long ptr ptr ptr)
-# @ stub GetApplicationUserModelId
+@ stdcall GetApplicationUserModelId(long ptr ptr)
 # @ stub GetApplicationUserModelIdFromToken
 # @ stub GetAppliedGPOListInternalA
 # @ stub GetAppliedGPOListInternalW
