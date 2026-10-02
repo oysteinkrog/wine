@@ -4628,17 +4628,37 @@ MINMAXINFO get_min_max_info( HWND hwnd )
 
     if (get_maximized_rect( hwnd, &rc_max ))
     {
+        MONITORINFO target = monitor_info_from_window( hwnd, MONITOR_DEFAULTTOPRIMARY );
+        MONITORINFO primary;
+        RECT rc_ref;
+
         rc_primary = get_primary_monitor_rect( get_thread_dpi() );
+        primary = monitor_info_from_rect( rc_primary, get_thread_dpi() );
+        /* The values the app returns describe the primary monitor. Move them to the
+         * monitor the window maximizes on, the way Windows does. */
+        rc_ref = EqualRect( &rc_max, &target.rcWork ) ? primary.rcWork : primary.rcMonitor;
+
         if (minmax.ptMaxSize.x == (rc_primary.right - rc_primary.left) + 2 * xinc &&
             minmax.ptMaxSize.y == (rc_primary.bottom - rc_primary.top) + 2 * yinc)
         {
             minmax.ptMaxSize.x = (rc_max.right - rc_max.left) + 2 * xinc;
             minmax.ptMaxSize.y = (rc_max.bottom - rc_max.top) + 2 * yinc;
         }
+        else if (minmax.ptMaxSize.x >= rc_ref.right - rc_ref.left &&
+                 minmax.ptMaxSize.y >= rc_ref.bottom - rc_ref.top)
+        {
+            minmax.ptMaxSize.x += (rc_max.right - rc_max.left) - (rc_ref.right - rc_ref.left);
+            minmax.ptMaxSize.y += (rc_max.bottom - rc_max.top) - (rc_ref.bottom - rc_ref.top);
+        }
         if (minmax.ptMaxPosition.x == -xinc && minmax.ptMaxPosition.y == -yinc)
         {
             minmax.ptMaxPosition.x = rc_max.left - xinc;
             minmax.ptMaxPosition.y = rc_max.top - yinc;
+        }
+        else
+        {
+            minmax.ptMaxPosition.x += rc_max.left - rc_ref.left;
+            minmax.ptMaxPosition.y += rc_max.top - rc_ref.top;
         }
     }
 
