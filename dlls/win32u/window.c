@@ -2124,6 +2124,15 @@ done:
 }
 
 
+/* The client area starts as close to the top edge as to the side edges, so the window
+ * draws its own title bar. */
+static BOOL has_custom_caption( UINT style, const struct window_rects *rects )
+{
+    if ((style & WS_CAPTION) != WS_CAPTION) return FALSE;
+    if (IsRectEmpty( &rects->client )) return FALSE;
+    return rects->client.top - rects->window.top <= rects->client.left - rects->window.left;
+}
+
 static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style, const struct window_rects *rects )
 {
     struct ratio dpi = get_dpi_for_window( hwnd );
@@ -2133,6 +2142,9 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
+    /* A window that draws its own title bar in the client area has no caption for the
+     * window manager to replace. The driver asks for no title in that case either. */
+    if (has_custom_caption( style, rects )) style_mask &= ~WS_DLGFRAME;
     if (!adjust_window_rect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, round_dpi( dpi ) )) return rects->window;
 
     visible_rect = rects->window;
@@ -2140,6 +2152,14 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     visible_rect.right  -= rect.right;
     visible_rect.top    -= rect.top;
     visible_rect.bottom -= rect.bottom;
+    /* Never hide part of the client area behind the window manager's frame. */
+    if (!IsRectEmpty( &rects->client ))
+    {
+        visible_rect.left   = min( visible_rect.left, rects->client.left );
+        visible_rect.top    = min( visible_rect.top, rects->client.top );
+        visible_rect.right  = max( visible_rect.right, rects->client.right );
+        visible_rect.bottom = max( visible_rect.bottom, rects->client.bottom );
+    }
     if (visible_rect.top >= visible_rect.bottom) visible_rect.bottom = visible_rect.top + 1;
     if (visible_rect.left >= visible_rect.right) visible_rect.right = visible_rect.left + 1;
 

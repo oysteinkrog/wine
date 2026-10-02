@@ -506,8 +506,16 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
  */
 static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
 {
+    unsigned long ret;
+
     if (EqualRect( &data->rects.window, &data->rects.visible )) return 0;
-    return get_mwm_decorations_for_style( style, ex_style );
+    ret = get_mwm_decorations_for_style( style, ex_style );
+    /* The window draws its own title bar in the client area (win32u leaves it visible),
+     * so a window manager title bar would be a second one. */
+    if (!IsRectEmpty( &data->rects.client ) &&
+        data->rects.client.top - data->rects.window.top <= data->rects.client.left - data->rects.window.left)
+        ret &= ~(MWM_DECOR_TITLE | MWM_DECOR_MENU | MWM_DECOR_MINIMIZE | MWM_DECOR_MAXIMIZE);
+    return ret;
 }
 
 
