@@ -221,6 +221,24 @@ struct d2d_device_context
     struct d2d_clip_stack clip_stack;
 
     struct d2d_indexed_objects vertex_buffers;
+
+    /* FIXGHOST: geometric-mask layer clipping via the stencil buffer
+     * (opt-in, env D2D_LAYER_MASK). Lets PushLayer(geometricMask) actually
+     * clip - needed for Lightroom's histogram fills. */
+    ID3D11Texture2D *ds_texture;
+    ID3D11DepthStencilView *dsv;
+    D2D1_SIZE_U ds_size;
+    ID3D11DepthStencilState *ds_write, *ds_test, *ds_decr;
+    ID3D11BlendState *bs_no_color;
+    unsigned int stencil_ref;     /* current layer nesting depth written to stencil */
+    unsigned int stencil_mode;    /* 0 = normal draw, 1 = mask write (INCR), 2 = mask erase (DECR) */
+    struct d2d_layer_entry
+    {
+        ID2D1Geometry *mask;      /* held ref while pushed; NULL = no geometric mask */
+        D2D1_MATRIX_3X2_F mask_transform;
+        D2D1_MATRIX_3X2_F world_transform;  /* world transform captured at PushLayer */
+    } *layers;
+    size_t layers_size, layers_count;
 };
 
 HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,

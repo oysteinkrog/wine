@@ -116,6 +116,137 @@ static void d2d_clip_stack_pop(struct d2d_clip_stack *stack)
     --stack->count;
 }
 
+/* FIXGHOST: opt-in geometric-mask layer clipping (env D2D_LAYER_MASK=1). */
+static BOOL d2d_layer_mask_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char *e = getenv("D2D_LAYER_MASK");
+        enabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return enabled;
+}
+
+static void d2d_device_context_clear_layers(struct d2d_device_context *context)
+{
+    while (context->layers_count)
+    {
+        struct d2d_layer_entry *entry = &context->layers[--context->layers_count];
+
+        if (entry->mask)
+            ID2D1Geometry_Release(entry->mask);
+    }
+
+    context->stencil_ref = 0;
+    context->stencil_mode = 0;
+}
+
+static void d2d_device_context_release_stencil_target(struct d2d_device_context *context)
+{
+    if (context->dsv)
+        ID3D11DepthStencilView_Release(context->dsv);
+    context->dsv = NULL;
+    if (context->ds_texture)
+        ID3D11Texture2D_Release(context->ds_texture);
+    context->ds_texture = NULL;
+    memset(&context->ds_size, 0, sizeof(context->ds_size));
+}
+
+/* Create (or resize) the stencil buffer and the three stencil states used to
+ * rasterise/test/erase geometric layer masks. Returns FALSE on failure. */
+static BOOL d2d_device_context_ensure_stencil(struct d2d_device_context *context)
+{
+    D3D11_DEPTH_STENCILOP_DESC keep = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+            D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_EQUAL};
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_BLEND_DESC bd;
+    HRESULT hr;
+
+    if (!context->pixel_size.width || !context->pixel_size.height)
+        return FALSE;
+
+    if (context->ds_texture
+            && (context->ds_size.width != context->pixel_size.width
+                || context->ds_size.height != context->pixel_size.height))
+        d2d_device_context_release_stencil_target(context);
+
+    if (!context->ds_texture)
+    {
+        memset(&td, 0, sizeof(td));
+        td.Width = context->pixel_size.width;
+        td.Height = context->pixel_size.height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (FAILED(hr = ID3D11Device1_CreateTexture2D(context->d3d_device, &td, NULL, &context->ds_texture)))
+        {
+            WARN("Failed to create stencil texture, hr %#lx.\n", hr);
+            return FALSE;
+        }
+        if (FAILED(hr = ID3D11Device1_CreateDepthStencilView(context->d3d_device,
+                (ID3D11Resource *)context->ds_texture, NULL, &context->dsv)))
+        {
+            WARN("Failed to create depth-stencil view, hr %#lx.\n", hr);
+            ID3D11Texture2D_Release(context->ds_texture);
+            context->ds_texture = NULL;
+            return FALSE;
+        }
+        context->ds_size = context->pixel_size;
+    }
+
+    memset(&dsd, 0, sizeof(dsd));
+    dsd.DepthEnable = FALSE;
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dsd.StencilEnable = TRUE;
+    dsd.StencilReadMask = 0xff;
+    dsd.StencilWriteMask = 0xff;
+
+    if (!context->ds_write)
+    {
+        /* write: where stencil == ref (= level-1), INCR to level */
+        dsd.FrontFace = keep;
+        dsd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_INCR_SAT;
+        dsd.BackFace = dsd.FrontFace;
+        if (FAILED(hr = ID3D11Device1_CreateDepthStencilState(context->d3d_device, &dsd, &context->ds_write)))
+            WARN("Failed to create write stencil state, hr %#lx.\n", hr);
+    }
+
+    if (!context->ds_test)
+    {
+        /* test: pass where stencil == ref (= level) */
+        dsd.FrontFace = keep;
+        dsd.BackFace = keep;
+        if (FAILED(hr = ID3D11Device1_CreateDepthStencilState(context->d3d_device, &dsd, &context->ds_test)))
+            WARN("Failed to create test stencil state, hr %#lx.\n", hr);
+    }
+
+    if (!context->ds_decr)
+    {
+        /* erase: where stencil == ref (= level), DECR to level-1 */
+        dsd.FrontFace = keep;
+        dsd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_DECR_SAT;
+        dsd.BackFace = dsd.FrontFace;
+        if (FAILED(hr = ID3D11Device1_CreateDepthStencilState(context->d3d_device, &dsd, &context->ds_decr)))
+            WARN("Failed to create erase stencil state, hr %#lx.\n", hr);
+    }
+
+    if (!context->bs_no_color)
+    {
+        /* blend with colour writes off, for the stencil-only mask passes */
+        memset(&bd, 0, sizeof(bd));
+        bd.RenderTarget[0].RenderTargetWriteMask = 0;
+        if (FAILED(hr = ID3D11Device1_CreateBlendState(context->d3d_device, &bd, &context->bs_no_color)))
+            WARN("Failed to create no-colour blend state, hr %#lx.\n", hr);
+    }
+
+    return context->dsv && context->ds_write && context->ds_test && context->ds_decr && context->bs_no_color;
+}
+
 static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
         ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
         struct d2d_brush *brush, struct d2d_brush *opacity_brush)
@@ -171,8 +302,33 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
     }
     ID3D11DeviceContext1_RSSetScissorRects(context, 1, &scissor_rect);
     ID3D11DeviceContext1_RSSetState(context, render_target->rs);
-    ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv, NULL);
-    if (brush)
+
+    /* FIXGHOST: bind the stencil buffer and select the stencil state for the
+     * current layer mode (write/erase a mask, or test against active masks). */
+    {
+        ID3D11DepthStencilView *dsv = NULL;
+        ID3D11DepthStencilState *dss = NULL;
+        UINT sref = 0;
+
+        if (render_target->dsv && (render_target->stencil_mode || render_target->stencil_ref))
+        {
+            dsv = render_target->dsv;
+            if (render_target->stencil_mode == 1)      { dss = render_target->ds_write; sref = render_target->stencil_ref - 1; }
+            else if (render_target->stencil_mode == 2) { dss = render_target->ds_decr;  sref = render_target->stencil_ref; }
+            else                                       { dss = render_target->ds_test;  sref = render_target->stencil_ref; }
+        }
+        ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv, dsv);
+        ID3D11DeviceContext1_OMSetDepthStencilState(context, dss, sref);
+    }
+
+    if (render_target->stencil_mode)
+    {
+        /* mask pass: write/erase stencil only, no colour output */
+        ID3D11DeviceContext1_OMSetBlendState(context, render_target->bs_no_color, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+        if (brush)
+            d2d_brush_bind_resources(brush, render_target, 0);
+    }
+    else if (brush)
     {
         ID3D11DeviceContext1_OMSetBlendState(context, render_target->bs, NULL, D3D11_DEFAULT_SAMPLE_MASK);
         d2d_brush_bind_resources(brush, render_target, 0);
@@ -270,6 +426,17 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
     {
         unsigned int i, j, k;
 
+        d2d_device_context_clear_layers(context);
+        d2d_device_context_release_stencil_target(context);
+        if (context->ds_write)
+            ID3D11DepthStencilState_Release(context->ds_write);
+        if (context->ds_test)
+            ID3D11DepthStencilState_Release(context->ds_test);
+        if (context->ds_decr)
+            ID3D11DepthStencilState_Release(context->ds_decr);
+        if (context->bs_no_color)
+            ID3D11BlendState_Release(context->bs_no_color);
+        free(context->layers);
         d2d_clip_stack_cleanup(&context->clip_stack);
         IDWriteRenderingParams_Release(context->default_text_rendering_params);
         if (context->text_rendering_params)
@@ -1830,31 +1997,119 @@ static void STDMETHODCALLTYPE d2d_device_context_GetTags(ID2D1DeviceContext6 *if
     *tag2 = render_target->drawing_state.tag2;
 }
 
+/* FIXGHOST: rasterise a layer's geometric mask into the stencil buffer.
+ * mode 1 writes (INCR) the mask area at the new level; mode 2 erases (DECR)
+ * it when the layer is popped. Colour writes are off (see the draw path). */
+static void d2d_device_context_rasterise_mask(struct d2d_device_context *context,
+        const struct d2d_geometry *mask, const D2D1_MATRIX_3X2_F *mask_transform,
+        const D2D1_MATRIX_3X2_F *world_transform, unsigned int mode)
+{
+    D2D1_MATRIX_3X2_F previous_transform = context->drawing_state.transform;
+    D2D1_MATRIX_3X2_F transform = *mask_transform;
+
+    /* The mask is expressed in the layer's own space: it is transformed by
+     * maskTransform *and* by the world transform that was in effect when the
+     * layer was pushed. Using maskTransform alone drops the mask of every
+     * layer pushed under a non-identity transform (HiDPI scale, per-cell grid
+     * offsets), so the stencil test then rejects the whole layer content —
+     * that is what blanked the Library and Import thumbnail grids. */
+    d2d_matrix_multiply(&transform, world_transform);
+
+    context->drawing_state.transform = transform;
+    context->stencil_mode = mode;
+    d2d_device_context_fill_geometry(context, mask, NULL, NULL);
+    context->stencil_mode = 0;
+    context->drawing_state.transform = previous_transform;
+}
+
+static void d2d_device_context_push_layer(struct d2d_device_context *context,
+        const D2D1_LAYER_PARAMETERS1 *layer_parameters)
+{
+    const struct d2d_geometry *mask_impl;
+    struct d2d_layer_entry *entry;
+
+    if (context->target.type == D2D_TARGET_COMMAND_LIST)
+    {
+        d2d_command_list_push_layer(context->target.command_list, context, layer_parameters);
+        return;
+    }
+
+    /* We don't implement opacity/opacityBrush layers; only the geometric mask
+     * (which is what Lightroom's histogram fills rely on). Track every push so
+     * PopLayer stays balanced. */
+    if (!d2d_array_reserve((void **)&context->layers, &context->layers_size,
+            context->layers_count + 1, sizeof(*context->layers)))
+    {
+        WARN("Failed to grow the layer stack.\n");
+        return;
+    }
+    entry = &context->layers[context->layers_count++];
+    entry->mask = NULL;
+
+    if (d2d_layer_mask_enabled() && layer_parameters->geometricMask
+            && context->stencil_ref < 0xff
+            && (mask_impl = unsafe_impl_from_ID2D1Geometry(layer_parameters->geometricMask))
+            && d2d_device_context_ensure_stencil(context))
+    {
+        entry->mask = layer_parameters->geometricMask;
+        entry->mask_transform = layer_parameters->maskTransform;
+        /* Snapshot the world transform: PopLayer must erase the same pixels
+         * this push wrote, even if the app changed the transform meanwhile. */
+        entry->world_transform = context->drawing_state.transform;
+        ID2D1Geometry_AddRef(entry->mask);
+
+        if (context->stencil_ref == 0)
+        {
+            ID3D11DeviceContext *d3d_context;
+            ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+            ID3D11DeviceContext_ClearDepthStencilView(d3d_context, context->dsv, D3D11_CLEAR_STENCIL, 0.0f, 0);
+            ID3D11DeviceContext_Release(d3d_context);
+        }
+        ++context->stencil_ref;
+        d2d_device_context_rasterise_mask(context, mask_impl, &entry->mask_transform, &entry->world_transform, 1);
+    }
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *iface,
         const D2D1_LAYER_PARAMETERS *layer_parameters, ID2D1Layer *layer)
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    D2D1_LAYER_PARAMETERS1 parameters;
 
-    FIXME("iface %p, layer_parameters %p, layer %p stub!\n", iface, layer_parameters, layer);
+    TRACE("iface %p, layer_parameters %p, layer %p.\n", iface, layer_parameters, layer);
 
-    if (context->target.type == D2D_TARGET_COMMAND_LIST)
-    {
-        D2D1_LAYER_PARAMETERS1 parameters;
-
-        memcpy(&parameters, layer_parameters, sizeof(*layer_parameters));
-        parameters.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
-        d2d_command_list_push_layer(context->target.command_list, context, &parameters);
-    }
+    memcpy(&parameters, layer_parameters, sizeof(*layer_parameters));
+    parameters.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
+    d2d_device_context_push_layer(context, &parameters);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *iface)
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_layer_entry *entry;
 
-    FIXME("iface %p stub!\n", iface);
+    TRACE("iface %p.\n", iface);
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+    {
         d2d_command_list_pop_layer(context->target.command_list);
+        return;
+    }
+
+    if (!context->layers_count)
+        return;
+
+    entry = &context->layers[--context->layers_count];
+    if (entry->mask)
+    {
+        const struct d2d_geometry *mask_impl = unsafe_impl_from_ID2D1Geometry(entry->mask);
+
+        if (mask_impl && context->stencil_ref)
+            d2d_device_context_rasterise_mask(context, mask_impl, &entry->mask_transform, &entry->world_transform, 2);
+        if (context->stencil_ref)
+            --context->stencil_ref;
+        ID2D1Geometry_Release(entry->mask);
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_device_context_Flush(ID2D1DeviceContext6 *iface, D2D1_TAG *tag1, D2D1_TAG *tag2)
@@ -2554,6 +2809,10 @@ static void d2d_device_context_reset_target(struct d2d_device_context *context)
     if (context->bs)
         ID3D11BlendState_Release(context->bs);
     context->bs = NULL;
+
+    /* FIXGHOST: drop any open mask layers and the target-sized stencil. */
+    d2d_device_context_clear_layers(context);
+    d2d_device_context_release_stencil_target(context);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_SetTarget(ID2D1DeviceContext6 *iface, ID2D1Image *target)
@@ -2798,10 +3057,8 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
 
-    FIXME("iface %p, layer_parameters %p, layer %p stub!\n", iface, layer_parameters, layer);
-
-    if (context->target.type == D2D_TARGET_COMMAND_LIST)
-        d2d_command_list_push_layer(context->target.command_list, context, layer_parameters);
+    TRACE("iface %p, layer_parameters %p, layer %p.\n", iface, layer_parameters, layer);
+    d2d_device_context_push_layer(context, layer_parameters);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_device_context_InvalidateEffectInputRectangle(ID2D1DeviceContext6 *iface,
