@@ -738,6 +738,20 @@ struct token *get_token_obj( struct process *process, obj_handle_t handle, unsig
     return (struct token *)get_handle_obj( process, handle, access, &token_ops );
 }
 
+/* WINE_SERVICE_TOKEN=1 adds the LocalSystem group to the default token.
+ * Without it the token has the groups it has in upstream Wine. */
+static int localsystem_group_enabled( void )
+{
+    static int enabled = -1;
+
+    if (enabled == -1)
+    {
+        const char *str = getenv( "WINE_SERVICE_TOKEN" );
+        enabled = str && str[0] == '1' && !str[1];
+    }
+    return enabled;
+}
+
 struct token *token_create_admin( unsigned primary, int impersonation_level, int elevation, unsigned int session_id )
 {
     struct token *token = NULL;
@@ -794,8 +808,10 @@ struct token *token_create_admin( unsigned primary, int impersonation_level, int
         { &local_system_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
     };
 
+    /* the LocalSystem group is last, so leaving it out is a shorter count */
     token = create_token( primary, session_id, user_sid, &domain_users_sid, &domain_users_sid,
-                          admin_groups, ARRAY_SIZE( admin_groups ), admin_privs, ARRAY_SIZE( admin_privs ),
+                          admin_groups, ARRAY_SIZE( admin_groups ) - (localsystem_group_enabled() ? 0 : 1),
+                          admin_privs, ARRAY_SIZE( admin_privs ),
                           default_dacl, NULL, impersonation_level, elevation );
 
     /* Assign a high security label to the token. The default would be medium
