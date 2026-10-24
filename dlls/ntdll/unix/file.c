@@ -956,10 +956,25 @@ done:
 /* An SMB share matches names with or without case, depending on the server.
  * Find out once per mount: take an entry of the directory that has letters,
  * look it up with the case changed, and see if the same file comes back. */
+static struct { dev_t dev; BOOLEAN sens; LONG valid; } smb_case_cache[16];
+static LONG smb_case_cache_used;
+
+/* the probe result for an SMB volume, if there is one */
+static BOOL get_cached_smb_case_sensitivity( dev_t dev, BOOLEAN *sens )
+{
+    LONG i, used = min( ReadNoFence( &smb_case_cache_used ), ARRAY_SIZE(smb_case_cache) );
+
+    for (i = 0; i < used; i++)
+        if (ReadAcquire( &smb_case_cache[i].valid ) && smb_case_cache[i].dev == dev)
+        {
+            *sens = smb_case_cache[i].sens;
+            return TRUE;
+        }
+    return FALSE;
+}
+
 static BOOLEAN get_smb_case_sensitivity( int fd )
 {
-    static struct { dev_t dev; BOOLEAN sens; LONG valid; } cache[16];
-    static LONG cache_used;
     struct stat st, st_name, st_alt;
     struct dirent *de;
     BOOLEAN sens = TRUE, found = FALSE;
@@ -967,12 +982,9 @@ static BOOLEAN get_smb_case_sensitivity( int fd )
     unsigned int i;
     DIR *dir;
     int dir_fd;
-    LONG used;
 
     if (fstat( fd, &st ) == -1) return TRUE;
-    used = min( ReadNoFence( &cache_used ), ARRAY_SIZE(cache) );
-    for (i = 0; i < used; i++)
-        if (ReadAcquire( &cache[i].valid ) && cache[i].dev == st.st_dev) return cache[i].sens;
+    if (get_cached_smb_case_sensitivity( st.st_dev, &sens )) return sens;
 
     if ((dir_fd = dup( fd )) == -1) return TRUE;
     if (!(dir = fdopendir( dir_fd )))
@@ -1011,11 +1023,11 @@ static BOOLEAN get_smb_case_sensitivity( int fd )
     closedir( dir );
     if (!found) return TRUE;  /* no entry to test with; try again next time */
 
-    if ((i = InterlockedIncrement( &cache_used ) - 1) < ARRAY_SIZE(cache))
+    if ((i = InterlockedIncrement( &smb_case_cache_used ) - 1) < ARRAY_SIZE(smb_case_cache))
     {
-        cache[i].dev = st.st_dev;
-        cache[i].sens = sens;
-        WriteRelease( &cache[i].valid, 1 );
+        smb_case_cache[i].dev = st.st_dev;
+        smb_case_cache[i].sens = sens;
+        WriteRelease( &smb_case_cache[i].valid, 1 );
     }
     TRACE( "SMB volume %llx is case %ssensitive\n", (unsigned long long)st.st_dev, sens ? "" : "in" );
     return sens;
@@ -1084,6 +1096,13 @@ static BOOLEAN get_dir_case_sensitivity_stat( int root_fd, const char *dir )
     struct statfs stfs;
     struct stat st;
     int fd, flags;
+
+    /* On an SMB volume that was probed already, a stat() (served from the
+     * attribute cache) is enough: opening the directory and fstatfs() each
+     * cost a round trip to the server. */
+    if (!fstatat( root_fd, dir, &st, 0 ) && get_cached_smb_case_sensitivity( st.st_dev, &sens ))
+        return sens;
+    sens = TRUE;
 
     if ((fd = openat( root_fd, dir, O_RDONLY | O_NONBLOCK )) == -1)
         return TRUE;
