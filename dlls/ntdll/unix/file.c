@@ -2266,7 +2266,80 @@ static int find_dos_device( const char *path )
     return -1;
 }
 
+static NTSTATUS get_mountmgr_fs_info_uncached( HANDLE handle, int fd, struct mountmgr_unix_drive *drive, ULONG size );
+
+/* WINE_MOUNTMGR_CACHE=1 keeps the mountmgr's answer per Unix device for 30 seconds.
+ * Without it, every GetFileInformationByHandle() asks the server for the file's Unix
+ * name, opens the mountmgr device and sends it an ioctl that winedevice answers from
+ * another process: five or more server round trips and a signal, per file, for a
+ * volume serial number that does not change. Two drive letters on the same Unix
+ * device share one cached answer, so leave it off for such prefixes. */
+#define MOUNTMGR_CACHE_SIZE 16
+#define MOUNTMGR_CACHE_DATA 512
+static struct mountmgr_cache_entry
+{
+    dev_t      dev;
+    ULONGLONG  expires;
+    ULONG      len;
+    ULONGLONG  data[MOUNTMGR_CACHE_DATA / sizeof(ULONGLONG)];
+} mountmgr_cache[MOUNTMGR_CACHE_SIZE];
+static unsigned int mountmgr_cache_next;
+static pthread_mutex_t mountmgr_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int mountmgr_cache_enabled = -1;
+
+static ULONGLONG mountmgr_cache_now(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_unix_drive *drive, ULONG size )
+{
+    struct mountmgr_cache_entry *entry = NULL;
+    ULONGLONG data[MOUNTMGR_CACHE_DATA / sizeof(ULONGLONG)];
+    ULONGLONG now;
+    struct stat st;
+    unsigned int i;
+    NTSTATUS status;
+
+    if (mountmgr_cache_enabled == -1)
+    {
+        const char *str = getenv( "WINE_MOUNTMGR_CACHE" );
+        mountmgr_cache_enabled = str && *str == '1';
+    }
+    if (!mountmgr_cache_enabled || fd == -1 || fstat( fd, &st ))
+        return get_mountmgr_fs_info_uncached( handle, fd, drive, size );
+
+    now = mountmgr_cache_now();
+    pthread_mutex_lock( &mountmgr_cache_mutex );
+    for (i = 0; i < MOUNTMGR_CACHE_SIZE; i++)
+    {
+        if (mountmgr_cache[i].len && mountmgr_cache[i].dev == st.st_dev && mountmgr_cache[i].expires > now)
+        {
+            entry = &mountmgr_cache[i];
+            memcpy( drive, entry->data, min( size, entry->len ) );
+            break;
+        }
+    }
+    pthread_mutex_unlock( &mountmgr_cache_mutex );
+    if (entry) return STATUS_SUCCESS;
+
+    status = get_mountmgr_fs_info_uncached( handle, fd, (struct mountmgr_unix_drive *)data, sizeof(data) );
+    if (status) return status;
+    memcpy( drive, data, min( size, sizeof(data) ) );
+
+    pthread_mutex_lock( &mountmgr_cache_mutex );
+    entry = &mountmgr_cache[mountmgr_cache_next++ % MOUNTMGR_CACHE_SIZE];
+    entry->dev = st.st_dev;
+    entry->expires = now + 30000;
+    entry->len = sizeof(data);
+    memcpy( entry->data, data, sizeof(data) );
+    pthread_mutex_unlock( &mountmgr_cache_mutex );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS get_mountmgr_fs_info_uncached( HANDLE handle, int fd, struct mountmgr_unix_drive *drive, ULONG size )
 {
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING string;
