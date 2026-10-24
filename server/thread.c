@@ -1812,7 +1812,11 @@ DECL_HANDLER(open_thread)
     reply->handle = 0;
     if (thread)
     {
-        reply->handle = alloc_handle( current->process, thread, req->access, req->attributes );
+        /* SeDebugPrivilege bypasses the thread's DACL too; see open_process. */
+        if (token_has_debug_privilege())
+            reply->handle = alloc_handle_no_access_check( current->process, thread, req->access, req->attributes );
+        else
+            reply->handle = alloc_handle( current->process, thread, req->access, req->attributes );
         release_object( thread );
     }
 }

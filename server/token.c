@@ -753,7 +753,9 @@ struct token *token_create_admin( unsigned primary, int impersonation_level, int
         { SeShutdownPrivilege, 0 },
         { SeRemoteShutdownPrivilege, 0 },
         { SeTakeOwnershipPrivilege, 0 },
-        { SeDebugPrivilege, 0 },
+        /* Enabled, as it is in the LocalSystem token a service holds on
+         * Windows; services run with this token here. */
+        { SeDebugPrivilege, SE_PRIVILEGE_ENABLED },
         { SeSystemEnvironmentPrivilege, 0 },
         { SeSystemProfilePrivilege, 0 },
         { SeProfileSingleProcessPrivilege, 0 },
@@ -889,6 +891,16 @@ int token_check_privileges( struct token *token, int all_required, const struct 
         return (enabled_count == count);
     else
         return (enabled_count > 0);
+}
+
+/* whether the calling thread's token has SeDebugPrivilege enabled */
+int token_has_debug_privilege( void )
+{
+    const struct luid_attr debug_priv = { SeDebugPrivilege, 0 };
+    struct token *token = current->token ? current->token : current->process->token;
+
+    if (!token) return 0;
+    return token_check_privileges( token, TRUE, &debug_priv, 1, NULL );
 }
 
 int token_sid_present( struct token *token, const struct sid *sid, int deny )

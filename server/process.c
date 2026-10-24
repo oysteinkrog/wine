@@ -1450,7 +1450,15 @@ DECL_HANDLER(open_process)
     reply->handle = 0;
     if (process)
     {
-        reply->handle = alloc_handle( current->process, process, req->access, req->attributes );
+        /* A caller holding SeDebugPrivilege opens any process whatever its
+         * DACL says, as on Windows. Backblaze's bztransmit denies everyone
+         * access to its own process object and its service opens it by pid
+         * to supervise it; on Windows the service is LocalSystem, which has
+         * the privilege enabled. */
+        if (token_has_debug_privilege())
+            reply->handle = alloc_handle_no_access_check( current->process, process, req->access, req->attributes );
+        else
+            reply->handle = alloc_handle( current->process, process, req->access, req->attributes );
         release_object( process );
     }
 }
