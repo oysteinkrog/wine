@@ -778,6 +778,13 @@ struct token *token_create_admin( unsigned primary, int impersonation_level, int
         { &alias_admins_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY|SE_GROUP_OWNER },
         { &alias_users_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
         { &logon_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY|SE_GROUP_LOGON_ID },
+        /* Services run with this same token, where on Windows they run as
+         * LocalSystem. A process that grants access to itself only to
+         * LocalSystem (Backblaze's bztransmit does, and its bzserv opens it by
+         * pid to supervise it) is otherwise unreachable from the service that
+         * started it. The group goes last so the primary group index below
+         * still names domain_users. */
+        { &local_system_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
     };
 
     token = create_token( primary, session_id, user_sid, admin_groups, ARRAY_SIZE( admin_groups ),
