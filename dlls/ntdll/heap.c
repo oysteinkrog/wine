@@ -1108,7 +1108,9 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 
 static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
 {
-    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
+    struct entry *list = find_free_list( heap, block_size, FALSE );
+    struct list *ptr = &list->entry;
+    unsigned int skipped = 0;
     struct entry *entry;
     struct block *block;
     SIZE_T total_size;
@@ -1127,6 +1129,10 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
             list_remove( &entry->entry );
             return block;
         }
+        /* A fragmented heap can hold thousands of blocks just too small in this
+         * list, and each one is a cache miss or a page fault. Every block in the
+         * next list is large enough, so move on to it after a few. */
+        if (++skipped == 32 && list < &heap->free_lists[FREE_LIST_COUNT - 1]) ptr = &(list + 1)->entry;
     }
 
     /* make sure we can fit the block and a free entry at the end */
