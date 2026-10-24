@@ -2430,8 +2430,16 @@ static NTSTATUS read_directory_data_stat( struct dir_data *data, const char *uni
 {
     struct stat st;
 
-    /* if the file system is not case sensitive we can't find the actual name through stat() */
-    if (!get_dir_case_sensitivity( AT_FDCWD, "." )) return STATUS_NO_SUCH_FILE;
+    if (!get_dir_case_sensitivity( AT_FDCWD, "." ))
+    {
+        /* The file system matches names without case, so if stat() finds nothing, no
+         * entry can match and the directory need not be read. A name with a '~' may
+         * still match a generated short name. If stat() finds the file, only reading
+         * the directory gives the name as stored. */
+        if (!strchr( unix_name, '~' ) && stat( unix_name, &st ) == -1 && errno == ENOENT)
+            return STATUS_SUCCESS;
+        return STATUS_NO_SUCH_FILE;
+    }
     if (stat( unix_name, &st ) == -1) return STATUS_NO_SUCH_FILE;
 
     TRACE( "found %s\n", debugstr_a(unix_name) );
