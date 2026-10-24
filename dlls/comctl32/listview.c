@@ -11928,6 +11928,11 @@ LISTVIEW_WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
   case WM_MOUSEWHEEL:
       if (wParam & (MK_SHIFT | MK_CONTROL))
           return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+      /* Nothing to scroll without a scroll bar: let DefWindowProc pass the
+       * wheel to the parent, which may scroll the whole list. */
+      if (!(GetWindowLongW(hwnd, GWL_STYLE) &
+            (infoPtr->uView == LV_VIEW_LIST ? WS_HSCROLL : WS_VSCROLL)))
+          return DefWindowProcW(hwnd, uMsg, wParam, lParam);
       return LISTVIEW_MouseWheel(infoPtr, (short int)HIWORD(wParam));
 
   case WM_WINDOWPOSCHANGED:
