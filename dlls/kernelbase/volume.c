@@ -107,12 +107,38 @@ static BOOL open_device_root( LPCWSTR root, HANDLE *handle )
     return set_ntstatus( status );
 }
 
+/* WINE_MOUNTMGR_CACHE=1 keeps drive types for 30 seconds: the mountmgr's answer per
+ * drive letter, and GetDriveTypeW's answer per plain "X:" or "X:\" root. Each mountmgr
+ * query is answered by another process. Backblaze's scanner calls GetDriveTypeW for
+ * every file it lists, with the file's full path. */
+static int mountmgr_cache_on = -1;
+static volatile struct { UINT type; DWORD expires; } mountmgr_type_cache[26];
+
+static BOOL mountmgr_cache_enabled(void)
+{
+    if (mountmgr_cache_on == -1)
+    {
+        WCHAR value[4];
+        DWORD len = GetEnvironmentVariableW( L"WINE_MOUNTMGR_CACHE", value, ARRAY_SIZE(value) );
+        mountmgr_cache_on = len == 1 && value[0] == '1';
+    }
+    return mountmgr_cache_on;
+}
+
+static int mountmgr_type_cache_index( WCHAR letter )
+{
+    return mountmgr_cache_enabled() ? letter - 'A' : -1;
+}
+
 /* query the type of a drive from the mount manager */
 static DWORD get_mountmgr_drive_type( LPCWSTR root )
 {
     HANDLE mgr;
     struct mountmgr_unix_drive data;
     DWORD br;
+
+    WCHAR letter;
+    int idx;
 
     memset( &data, 0, sizeof(data) );
     if (root) data.letter = root[0];
@@ -124,6 +150,13 @@ static DWORD get_mountmgr_drive_type( LPCWSTR root )
         data.letter = curdir[0];
     }
 
+    /* WINE_MOUNTMGR_CACHE: the answer depends only on the letter. */
+    letter = towupper( data.letter );
+    idx = (letter >= 'A' && letter <= 'Z') ? mountmgr_type_cache_index( letter ) : -1;
+    if (idx >= 0 && mountmgr_type_cache[idx].expires
+        && (int)(mountmgr_type_cache[idx].expires - GetTickCount()) > 0)
+        return mountmgr_type_cache[idx].type;
+
     mgr = CreateFileW( MOUNTMGR_DOS_DEVICE_NAME, GENERIC_READ,
                        FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, 0 );
     if (mgr == INVALID_HANDLE_VALUE) return DRIVE_UNKNOWN;
@@ -133,6 +166,11 @@ static DWORD get_mountmgr_drive_type( LPCWSTR root )
         data.type = DRIVE_UNKNOWN;
 
     CloseHandle( mgr );
+    if (idx >= 0)
+    {
+        mountmgr_type_cache[idx].type = data.type;
+        mountmgr_type_cache[idx].expires = GetTickCount() + 30000;
+    }
     return data.type;
 }
 
@@ -549,24 +587,14 @@ UINT WINAPI DECLSPEC_HOTPATCH GetLogicalDriveStringsW( UINT len, LPWSTR buffer )
 /***********************************************************************
  *           GetDriveTypeW   (kernelbase.@)
  */
-/* WINE_MOUNTMGR_CACHE=1 keeps GetDriveTypeW's answer per drive letter for 30 seconds.
- * Each call opens the drive root, queries the device and asks the mountmgr, which
- * answers from another process. Backblaze's scanner calls it for every file. Only a
- * plain "X:" or "X:\" root is cached. */
-static int drive_type_cache_enabled = -1;
+/* GetDriveTypeW's answer per plain root; see mountmgr_cache_enabled(). */
 static volatile struct { UINT type; DWORD expires; } drive_type_cache[26];
 
 static int drive_type_cache_index( LPCWSTR root )
 {
     WCHAR c;
 
-    if (drive_type_cache_enabled == -1)
-    {
-        WCHAR value[4];
-        DWORD len = GetEnvironmentVariableW( L"WINE_MOUNTMGR_CACHE", value, ARRAY_SIZE(value) );
-        drive_type_cache_enabled = len == 1 && value[0] == '1';
-    }
-    if (!drive_type_cache_enabled || !root || !root[0] || root[1] != ':') return -1;
+    if (!mountmgr_cache_enabled() || !root || !root[0] || root[1] != ':') return -1;
     if (root[2] && (root[2] != '\\' || root[3])) return -1;
     c = towupper( root[0] );
     if (c < 'A' || c > 'Z') return -1;
