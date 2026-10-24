@@ -948,6 +948,74 @@ done:
 }
 #endif
 
+#ifdef __linux__
+#define SMB_CIFS_MAGIC 0xff534d42
+#define SMB_SMB2_MAGIC 0xfe534d42
+
+/* An SMB share matches names with or without case, depending on the server.
+ * Find out once per mount: take an entry of the directory that has letters,
+ * look it up with the case changed, and see if the same file comes back. */
+static BOOLEAN get_smb_case_sensitivity( int fd )
+{
+    static struct { dev_t dev; BOOLEAN sens; LONG valid; } cache[16];
+    static LONG cache_used;
+    struct stat st, st_name, st_alt;
+    struct dirent *de;
+    BOOLEAN sens = TRUE, found = FALSE;
+    char alt[MAX_DIR_ENTRY_LEN + 1];
+    unsigned int i;
+    DIR *dir;
+    int dir_fd;
+    LONG used;
+
+    if (fstat( fd, &st ) == -1) return TRUE;
+    used = min( ReadNoFence( &cache_used ), ARRAY_SIZE(cache) );
+    for (i = 0; i < used; i++)
+        if (ReadAcquire( &cache[i].valid ) && cache[i].dev == st.st_dev) return cache[i].sens;
+
+    if ((dir_fd = dup( fd )) == -1) return TRUE;
+    if (!(dir = fdopendir( dir_fd )))
+    {
+        close( dir_fd );
+        return TRUE;
+    }
+    while (!found && (de = readdir( dir )))
+    {
+        size_t len = strlen( de->d_name );
+        BOOLEAN changed = FALSE;
+
+        if (len > MAX_DIR_ENTRY_LEN) continue;
+        for (i = 0; i <= len; i++)
+        {
+            char c = de->d_name[i];
+            if (c >= 'a' && c <= 'z') { alt[i] = c - 'a' + 'A'; changed = TRUE; }
+            else if (c >= 'A' && c <= 'Z') { alt[i] = c - 'A' + 'a'; changed = TRUE; }
+            else alt[i] = c;
+        }
+        if (!changed) continue;
+        if (fstatat( fd, de->d_name, &st_name, AT_SYMLINK_NOFOLLOW ) == -1) continue;
+        if (!fstatat( fd, alt, &st_alt, AT_SYMLINK_NOFOLLOW ))
+            sens = !(st_alt.st_dev == st_name.st_dev && st_alt.st_ino == st_name.st_ino);
+        else if (errno == ENOENT)
+            sens = TRUE;
+        else
+            continue;
+        found = TRUE;
+    }
+    closedir( dir );
+    if (!found) return TRUE;  /* no entry to test with; try again next time */
+
+    if ((i = InterlockedIncrement( &cache_used ) - 1) < ARRAY_SIZE(cache))
+    {
+        cache[i].dev = st.st_dev;
+        cache[i].sens = sens;
+        WriteRelease( &cache[i].valid, 1 );
+    }
+    TRACE( "SMB volume %llx is case %ssensitive\n", (unsigned long long)st.st_dev, sens ? "" : "in" );
+    return sens;
+}
+#endif
+
 /***********************************************************************
  *           get_dir_case_sensitivity_stat
  *
@@ -1023,6 +1091,11 @@ static BOOLEAN get_dir_case_sensitivity_stat( int root_fd, const char *dir )
              fstatat( fd, ".ciopfs", &st, AT_NO_AUTOMOUNT ) == 0)  /* is CIOPFS, look for .ciopfs in the dir. */
     {
         sens = FALSE;
+    }
+    else if (fstatfs( fd, &stfs ) == 0 &&
+             (stfs.f_type == SMB_CIFS_MAGIC || stfs.f_type == SMB_SMB2_MAGIC))
+    {
+        sens = get_smb_case_sensitivity( fd );
     }
 
     close( fd );
@@ -2709,7 +2782,16 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     is_name_8_dot_3 = is_name_8_dot_3 && length >= 8 && name[4] == '~';
 #endif
 
-    if (!is_name_8_dot_3 && !get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
+    if (!get_dir_case_sensitivity( root_fd, unix_name ))
+    {
+        /* The exact lookup above failed on a case-insensitive volume, so only
+         * a generated short name, which has a '~', can still match. */
+        BOOLEAN tilde = FALSE;
+        unsigned int i;
+
+        for (i = 0; i < length; i++) if (name[i] == '~') tilde = TRUE;
+        if (!is_name_8_dot_3 || !tilde) goto not_found;
+    }
 
     /* now look for it through the directory */
 
