@@ -2272,14 +2272,16 @@ static NTSTATUS get_mountmgr_fs_info_uncached( HANDLE handle, int fd, struct mou
  * Without it, every GetFileInformationByHandle() asks the server for the file's Unix
  * name, opens the mountmgr device and sends it an ioctl that winedevice answers from
  * another process: five or more server round trips and a signal, per file, for a
- * volume serial number that does not change. Two drive letters on the same Unix
- * device share one cached answer, so leave it off for such prefixes. */
+ * volume serial number that does not change. A failed query is cached too: a drive
+ * the mountmgr does not know fails the same way every time. Two drive letters on the
+ * same Unix device share one cached answer, so leave it off for such prefixes. */
 #define MOUNTMGR_CACHE_SIZE 16
 #define MOUNTMGR_CACHE_DATA 512
 static struct mountmgr_cache_entry
 {
     dev_t      dev;
     ULONGLONG  expires;
+    NTSTATUS   status;
     ULONG      len;
     ULONGLONG  data[MOUNTMGR_CACHE_DATA / sizeof(ULONGLONG)];
 } mountmgr_cache[MOUNTMGR_CACHE_SIZE];
@@ -2318,25 +2320,26 @@ static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_uni
         if (mountmgr_cache[i].len && mountmgr_cache[i].dev == st.st_dev && mountmgr_cache[i].expires > now)
         {
             entry = &mountmgr_cache[i];
-            memcpy( drive, entry->data, min( size, entry->len ) );
+            status = entry->status;
+            if (!status) memcpy( drive, entry->data, min( size, entry->len ) );
             break;
         }
     }
     pthread_mutex_unlock( &mountmgr_cache_mutex );
-    if (entry) return STATUS_SUCCESS;
+    if (entry) return status;
 
     status = get_mountmgr_fs_info_uncached( handle, fd, (struct mountmgr_unix_drive *)data, sizeof(data) );
-    if (status) return status;
-    memcpy( drive, data, min( size, sizeof(data) ) );
+    if (!status) memcpy( drive, data, min( size, sizeof(data) ) );
 
     pthread_mutex_lock( &mountmgr_cache_mutex );
     entry = &mountmgr_cache[mountmgr_cache_next++ % MOUNTMGR_CACHE_SIZE];
     entry->dev = st.st_dev;
     entry->expires = now + 30000;
+    entry->status = status;
     entry->len = sizeof(data);
     memcpy( entry->data, data, sizeof(data) );
     pthread_mutex_unlock( &mountmgr_cache_mutex );
-    return STATUS_SUCCESS;
+    return status;
 }
 
 static NTSTATUS get_mountmgr_fs_info_uncached( HANDLE handle, int fd, struct mountmgr_unix_drive *drive, ULONG size )
