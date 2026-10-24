@@ -549,7 +549,50 @@ UINT WINAPI DECLSPEC_HOTPATCH GetLogicalDriveStringsW( UINT len, LPWSTR buffer )
 /***********************************************************************
  *           GetDriveTypeW   (kernelbase.@)
  */
+/* WINE_MOUNTMGR_CACHE=1 keeps GetDriveTypeW's answer per drive letter for 30 seconds.
+ * Each call opens the drive root, queries the device and asks the mountmgr, which
+ * answers from another process. Backblaze's scanner calls it for every file. Only a
+ * plain "X:" or "X:\" root is cached. */
+static int drive_type_cache_enabled = -1;
+static volatile struct { UINT type; DWORD expires; } drive_type_cache[26];
+
+static int drive_type_cache_index( LPCWSTR root )
+{
+    WCHAR c;
+
+    if (drive_type_cache_enabled == -1)
+    {
+        WCHAR value[4];
+        DWORD len = GetEnvironmentVariableW( L"WINE_MOUNTMGR_CACHE", value, ARRAY_SIZE(value) );
+        drive_type_cache_enabled = len == 1 && value[0] == '1';
+    }
+    if (!drive_type_cache_enabled || !root || !root[0] || root[1] != ':') return -1;
+    if (root[2] && (root[2] != '\\' || root[3])) return -1;
+    c = towupper( root[0] );
+    if (c < 'A' || c > 'Z') return -1;
+    return c - 'A';
+}
+
+static UINT get_drive_type_uncached( LPCWSTR root );
+
 UINT WINAPI DECLSPEC_HOTPATCH GetDriveTypeW( LPCWSTR root )
+{
+    int idx = drive_type_cache_index( root );
+    DWORD now = GetTickCount();
+    UINT ret;
+
+    if (idx >= 0 && drive_type_cache[idx].expires && (int)(drive_type_cache[idx].expires - now) > 0)
+        return drive_type_cache[idx].type;
+    ret = get_drive_type_uncached( root );
+    if (idx >= 0)
+    {
+        drive_type_cache[idx].type = ret;
+        drive_type_cache[idx].expires = now + 30000;
+    }
+    return ret;
+}
+
+static UINT get_drive_type_uncached( LPCWSTR root )
 {
     FILE_FS_DEVICE_INFORMATION info;
     IO_STATUS_BLOCK io;
