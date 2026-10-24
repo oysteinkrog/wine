@@ -3673,6 +3673,19 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
             {
                 if (sock_stream_send_ready( sock ))
                     pollfd.revents |= POLLOUT;
+                else if ((sock->reported_events & AFD_POLL_WRITE) &&
+                         !(sock->pending_events & AFD_POLL_WRITE))
+                {
+                    /* Once reported, sock_get_poll_events() masks POLLOUT and suppresses another
+                     * FD_WRITE. A connected stream that cannot accept a send is back in the
+                     * would-block state, so clearing the latch safely allows the next writable
+                     * transition to report it again. Preserve an already pending FD_WRITE. This
+                     * fills a writable / not writable / writable state that Windows may never
+                     * enter through polling alone; conformance remains to be established. The
+                     * reselect loop at the end of poll_socket() picks up the cleared latch, so no
+                     * explicit reselect is needed here. */
+                    sock->reported_events &= ~AFD_POLL_WRITE;
+                }
             }
             sock_poll_event( sock->fd, pollfd.revents );
         }
