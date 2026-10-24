@@ -995,7 +995,12 @@ static BOOLEAN get_smb_case_sensitivity( int fd )
         if (!changed) continue;
         if (fstatat( fd, de->d_name, &st_name, AT_SYMLINK_NOFOLLOW ) == -1) continue;
         if (!fstatat( fd, alt, &st_alt, AT_SYMLINK_NOFOLLOW ))
-            sens = !(st_alt.st_dev == st_name.st_dev && st_alt.st_ino == st_name.st_ino);
+            /* The kernel SMB client gives the other spelling its own inode
+             * number, so compare what the server reports for the file. */
+            sens = !(st_alt.st_dev == st_name.st_dev && st_alt.st_size == st_name.st_size &&
+                     st_alt.st_mtim.tv_sec == st_name.st_mtim.tv_sec &&
+                     st_alt.st_mtim.tv_nsec == st_name.st_mtim.tv_nsec &&
+                     (st_alt.st_mode & S_IFMT) == (st_name.st_mode & S_IFMT));
         else if (errno == ENOENT)
             sens = TRUE;
         else
