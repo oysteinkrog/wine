@@ -3596,6 +3596,22 @@ static int send_ready_enabled( void )
     return enabled;
 }
 
+/* WINE_SOCK_FDWRITE_REARM=1 turns on the FD_WRITE re-arm in poll_socket().
+ * It only makes sense with the send-readiness check, so it also needs
+ * WINE_SOCK_SEND_READY=1. */
+static int fdwrite_rearm_enabled( void )
+{
+    static int enabled = -1;
+
+    if (enabled == -1)
+    {
+        const char *rearm = getenv( "WINE_SOCK_FDWRITE_REARM" );
+        const char *ready = getenv( "WINE_SOCK_SEND_READY" );
+        enabled = rearm && !strcmp( rearm, "1" ) && ready && !strcmp( ready, "1" );
+    }
+    return enabled;
+}
+
 static int sock_stream_send_ready( struct sock *sock )
 {
 #ifdef SO_MEMINFO
@@ -3690,7 +3706,8 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
             {
                 if (sock_stream_send_ready( sock ))
                     pollfd.revents |= POLLOUT;
-                else if ((sock->reported_events & AFD_POLL_WRITE) &&
+                else if (fdwrite_rearm_enabled() &&
+                         (sock->reported_events & AFD_POLL_WRITE) &&
                          !(sock->pending_events & AFD_POLL_WRITE))
                 {
                     /* Once reported, sock_get_poll_events() masks POLLOUT and suppresses another
