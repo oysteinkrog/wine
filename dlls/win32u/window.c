@@ -3960,16 +3960,21 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
     }
     winpos->hwnd = win->handle;  /* make it a full handle */
 
-    /* Finally make sure that all coordinates are valid */
-    if (winpos->x < -32768) winpos->x = -32768;
-    else if (winpos->x > 32767) winpos->x = 32767;
-    if (winpos->y < -32768) winpos->y = -32768;
-    else if (winpos->y > 32767) winpos->y = 32767;
+    /* Finally make sure that all coordinates are valid. Windows keeps child
+     * windows at 32-bit sizes and positions: Lightroom Classic scrolls its
+     * Library grid by moving a child window that is millions of pixels tall. */
+    if (!(win->dwStyle & WS_CHILD))
+    {
+        if (winpos->x < -32768) winpos->x = -32768;
+        else if (winpos->x > 32767) winpos->x = 32767;
+        if (winpos->y < -32768) winpos->y = -32768;
+        else if (winpos->y > 32767) winpos->y = 32767;
+    }
 
     if (winpos->cx < 0) winpos->cx = 0;
-    else if (winpos->cx > 32767) winpos->cx = 32767;
+    else if (winpos->cx > 32767 && !(win->dwStyle & WS_CHILD)) winpos->cx = 32767;
     if (winpos->cy < 0) winpos->cy = 0;
-    else if (winpos->cy > 32767) winpos->cy = 32767;
+    else if (winpos->cy > 32767 && !(win->dwStyle & WS_CHILD)) winpos->cy = 32767;
 
     parent = NtUserGetAncestor( winpos->hwnd, GA_PARENT );
     if (!is_window_visible( parent )) winpos->flags |= SWP_NOREDRAW;
@@ -4125,7 +4130,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     struct window_surface *surface;
     struct window_rects old_rects, new_rects;
     UINT orig_flags, context;
-    BOOL ret = FALSE;
+    BOOL ret = FALSE, child_win;
 
     orig_flags = winpos->flags;
 
@@ -4152,8 +4157,10 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         }
     }
 
-    /* Make sure that coordinates are valid for WM_WINDOWPOSCHANGING */
-    if (!(winpos->flags & SWP_NOMOVE))
+    /* Make sure that coordinates are valid for WM_WINDOWPOSCHANGING.
+     * Child windows keep 32-bit values, see fixup_swp_flags. */
+    child_win = (get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD) != 0;
+    if (!(winpos->flags & SWP_NOMOVE) && !child_win)
     {
         if (winpos->x < -32768) winpos->x = -32768;
         else if (winpos->x > 32767) winpos->x = 32767;
@@ -4163,9 +4170,9 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     if (!(winpos->flags & SWP_NOSIZE))
     {
         if (winpos->cx < 0) winpos->cx = 0;
-        else if (winpos->cx > 32767) winpos->cx = 32767;
+        else if (winpos->cx > 32767 && !child_win) winpos->cx = 32767;
         if (winpos->cy < 0) winpos->cy = 0;
-        else if (winpos->cy > 32767) winpos->cy = 32767;
+        else if (winpos->cy > 32767 && !child_win) winpos->cy = 32767;
     }
 
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( winpos->hwnd ));
