@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2426,6 +2427,108 @@ static NTSTATUS read_directory_data_getattrlist( struct dir_data *data, const ch
  * Read a single file from a directory by determining whether the file
  * identified by mask exists using stat.
  */
+/* Names as stored in recently read directories of case-insensitive volumes, so that
+ * looking up one existing file by name does not read the whole directory each time.
+ * An entry is valid while the directory's change time is the same. Protected by
+ * dir_mutex. */
+struct stored_names
+{
+    dev_t dev;
+    ino_t ino;
+    struct timespec mtime;
+    unsigned int count;
+    char **names;  /* sorted with strcasecmp */
+};
+static struct stored_names stored_names_cache[16];
+static unsigned int stored_names_next;
+
+static int compare_stored_names( const void *a, const void *b )
+{
+    return strcasecmp( *(char * const *)a, *(char * const *)b );
+}
+
+static void free_stored_names( struct stored_names *entry )
+{
+    unsigned int i;
+
+    for (i = 0; i < entry->count; i++) free( entry->names[i] );
+    free( entry->names );
+    memset( entry, 0, sizeof(*entry) );
+}
+
+/* read the current directory into a cache entry; returns NULL on failure */
+static struct stored_names *read_stored_names( const struct stat *st_dir )
+{
+    struct stored_names *entry = &stored_names_cache[stored_names_next++ % ARRAY_SIZE(stored_names_cache)];
+    unsigned int size = 0;
+    struct dirent *de;
+    DIR *dir;
+
+    free_stored_names( entry );
+    if (!(dir = opendir( "." ))) return NULL;
+    while ((de = readdir( dir )))
+    {
+        if (!strcmp( de->d_name, "." ) || !strcmp( de->d_name, ".." )) continue;
+        if (entry->count == size)
+        {
+            char **names = realloc( entry->names, (size = max( 64, size * 2 )) * sizeof(*names) );
+            if (!names) goto failed;
+            entry->names = names;
+        }
+        if (!(entry->names[entry->count] = strdup( de->d_name ))) goto failed;
+        entry->count++;
+    }
+    closedir( dir );
+    qsort( entry->names, entry->count, sizeof(*entry->names), compare_stored_names );
+    entry->dev = st_dir->st_dev;
+    entry->ino = st_dir->st_ino;
+    entry->mtime = st_dir->st_mtim;
+    return entry;
+
+failed:
+    closedir( dir );
+    free_stored_names( entry );
+    return NULL;
+}
+
+/* find the name as stored for an existing file in the current directory, or NULL */
+static const char *find_stored_name( const char *unix_name )
+{
+    struct stored_names *entry = NULL;
+    struct stat st_dir;
+    const char *p, *key = unix_name;
+    char **found;
+    unsigned int i;
+    int pass;
+
+    /* strcasecmp only folds ASCII, so leave other names to the directory read */
+    for (p = unix_name; *p; p++) if ((unsigned char)*p >= 0x80 || *p == '/') return NULL;
+    if (stat( ".", &st_dir ) == -1) return NULL;
+
+    for (i = 0; i < ARRAY_SIZE(stored_names_cache); i++)
+    {
+        struct stored_names *e = &stored_names_cache[i];
+        if (!e->names || e->dev != st_dir.st_dev || e->ino != st_dir.st_ino) continue;
+        if (e->mtime.tv_sec == st_dir.st_mtim.tv_sec && e->mtime.tv_nsec == st_dir.st_mtim.tv_nsec)
+            entry = e;
+        else
+            free_stored_names( e );
+        break;
+    }
+
+    for (pass = 0; pass < 2; pass++)
+    {
+        BOOL fresh = !entry;
+
+        if (fresh && !(entry = read_stored_names( &st_dir ))) return NULL;
+        found = bsearch( &key, entry->names, entry->count, sizeof(*entry->names), compare_stored_names );
+        if (found) return *found;
+        if (fresh) break;
+        entry = NULL;  /* the file is newer than the cached list: read the directory again */
+    }
+    return NULL;
+}
+
 static NTSTATUS read_directory_data_stat( struct dir_data *data, const char *unix_name )
 {
     struct stat st;
@@ -2436,9 +2539,14 @@ static NTSTATUS read_directory_data_stat( struct dir_data *data, const char *uni
          * entry can match and the directory need not be read. A name with a '~' may
          * still match a generated short name. If stat() finds the file, only reading
          * the directory gives the name as stored. */
-        if (!strchr( unix_name, '~' ) && stat( unix_name, &st ) == -1 && errno == ENOENT)
-            return STATUS_SUCCESS;
-        return STATUS_NO_SUCH_FILE;
+        const char *stored;
+
+        if (strchr( unix_name, '~' )) return STATUS_NO_SUCH_FILE;
+        if (stat( unix_name, &st ) == -1) return errno == ENOENT ? STATUS_SUCCESS : STATUS_NO_SUCH_FILE;
+        if (!(stored = find_stored_name( unix_name ))) return STATUS_NO_SUCH_FILE;
+        TRACE( "found %s as %s\n", debugstr_a(unix_name), debugstr_a(stored) );
+        if (!append_entry( data, stored, NULL, NULL )) return STATUS_NO_MEMORY;
+        return STATUS_SUCCESS;
     }
     if (stat( unix_name, &st ) == -1) return STATUS_NO_SUCH_FILE;
 
