@@ -964,7 +964,21 @@ static int is_device_removable( dev_t dev, int unix_fd )
     /* check for floppy disk */
     if (major(dev) == FLOPPY_MAJOR) return 1;
 
+    /* The device object goes away when its last file is closed, so a program
+     * that opens one file at a time calls this for every open. On a network
+     * share each fstatfs() is a round trip, so remember those devices. */
+    static dev_t network_devs[16];
+    static unsigned int network_dev_count;
+    unsigned int i;
+
+    for (i = 0; i < network_dev_count; i++) if (network_devs[i] == dev) return 0;
+
     if (fstatfs( unix_fd, &stfs ) == -1) return 0;
+    if ((stfs.f_type == 0xff534d42 ||   /* cifs */
+         stfs.f_type == 0xfe534d42 ||   /* smb2 */
+         stfs.f_type == 0x6969) &&      /* nfs */
+        network_dev_count < ARRAY_SIZE(network_devs))
+        network_devs[network_dev_count++] = dev;
     return (stfs.f_type == 0x9660 ||    /* iso9660 */
             stfs.f_type == 0x9fa1 ||    /* supermount */
             stfs.f_type == 0x15013346); /* udf */

@@ -973,10 +973,13 @@ static BOOL get_cached_smb_case_sensitivity( dev_t dev, BOOLEAN *sens )
     return FALSE;
 }
 
-/* Wine keeps DOS attributes and reparse data in user xattrs, which an SMB
+/* Whether the file is on an SMB volume that the case probe has seen.
+ *
+ * Wine keeps DOS attributes and reparse data in user xattrs, which an SMB
  * share stores as EAs on the server. Each read is a server round trip, and
- * files on a share almost never have them, so skip the reads there. */
-static BOOL skip_xattrs( const struct stat *st )
+ * files on a share almost never have them, so the callers skip the reads
+ * there. */
+static BOOL is_known_smb_volume( const struct stat *st )
 {
     BOOLEAN sens;
     return get_cached_smb_case_sensitivity( st->st_dev, &sens );
@@ -1042,7 +1045,7 @@ static BOOLEAN get_smb_case_sensitivity( int fd )
     return sens;
 }
 #else
-static BOOL skip_xattrs( const struct stat *st ) { return FALSE; }
+static BOOL is_known_smb_volume( const struct stat *st ) { return FALSE; }
 #endif
 
 /***********************************************************************
@@ -1505,7 +1508,7 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
         }
     }
 
-    if (skip_xattrs( st )) return ret;
+    if (is_known_smb_volume( st )) return ret;
 
     attr_len = xattr_fget( fd, XATTR_REPARSE, buffer, sizeof(buffer) );
     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
@@ -1624,7 +1627,7 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     }
     *attr |= get_file_attributes( st );
 
-    if (skip_xattrs( st ))
+    if (is_known_smb_volume( st ))
     {
         if (is_hidden_file( path )) *attr |= FILE_ATTRIBUTE_HIDDEN;
         return ret;
@@ -7245,7 +7248,9 @@ NTSTATUS get_device_info( int fd, FILE_FS_DEVICE_INFORMATION *info )
         if (major(st.st_dev) == FLOPPY_MAJOR)
             info->Characteristics |= FILE_REMOVABLE_MEDIA;
 
-        if (fstatfs( fd, &stfs ) < 0) stfs.f_type = 0;
+        /* fstatfs() is a round trip on SMB */
+        if (is_known_smb_volume( &st )) stfs.f_type = 0xfe534d42;
+        else if (fstatfs( fd, &stfs ) < 0) stfs.f_type = 0;
         switch (stfs.f_type)
         {
         case 0x9660:      /* iso9660 */
