@@ -3581,12 +3581,29 @@ static void handle_exclusive_poll(struct poll_req *req)
     }
 }
 
+/* WINE_SOCK_SEND_READY=1 turns the check below on. Without it a socket is
+ * writable only when poll() says so, as in upstream Wine. Read once, when the
+ * server first needs it. */
+static int send_ready_enabled( void )
+{
+    static int enabled = -1;
+
+    if (enabled == -1)
+    {
+        const char *str = getenv( "WINE_SOCK_SEND_READY" );
+        enabled = str && !strcmp( str, "1" );
+    }
+    return enabled;
+}
+
 static int sock_stream_send_ready( struct sock *sock )
 {
 #ifdef SO_MEMINFO
     unsigned int meminfo[SK_MEMINFO_VARS];
     socklen_t len = sizeof(meminfo);
     int unix_fd;
+
+    if (!send_ready_enabled()) return 0;
 
     if (sock->type != WS_SOCK_STREAM || sock->state != SOCK_CONNECTED || sock->wr_shutdown)
         return 0;
