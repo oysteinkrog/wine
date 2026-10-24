@@ -973,6 +973,15 @@ static BOOL get_cached_smb_case_sensitivity( dev_t dev, BOOLEAN *sens )
     return FALSE;
 }
 
+/* Wine keeps DOS attributes and reparse data in user xattrs, which an SMB
+ * share stores as EAs on the server. Each read is a server round trip, and
+ * files on a share almost never have them, so skip the reads there. */
+static BOOL skip_xattrs( const struct stat *st )
+{
+    BOOLEAN sens;
+    return get_cached_smb_case_sensitivity( st->st_dev, &sens );
+}
+
 static BOOLEAN get_smb_case_sensitivity( int fd )
 {
     struct stat st, st_name, st_alt;
@@ -1032,6 +1041,8 @@ static BOOLEAN get_smb_case_sensitivity( int fd )
     TRACE( "SMB volume %llx is case %ssensitive\n", (unsigned long long)st.st_dev, sens ? "" : "in" );
     return sens;
 }
+#else
+static BOOL skip_xattrs( const struct stat *st ) { return FALSE; }
 #endif
 
 /***********************************************************************
@@ -1494,6 +1505,8 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
         }
     }
 
+    if (skip_xattrs( st )) return ret;
+
     attr_len = xattr_fget( fd, XATTR_REPARSE, buffer, sizeof(buffer) );
     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
     {
@@ -1610,6 +1623,12 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
         free( parent_path );
     }
     *attr |= get_file_attributes( st );
+
+    if (skip_xattrs( st ))
+    {
+        if (is_hidden_file( path )) *attr |= FILE_ATTRIBUTE_HIDDEN;
+        return ret;
+    }
 
     attr_len = xattr_get( path, XATTR_REPARSE, buffer, sizeof(buffer) );
     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
