@@ -769,7 +769,7 @@ struct token *token_create_admin( unsigned primary, int impersonation_level, int
         { SeTakeOwnershipPrivilege, 0 },
         /* Enabled, as it is in the LocalSystem token a service holds on
          * Windows; services run with this token here. */
-        { SeDebugPrivilege, SE_PRIVILEGE_ENABLED },
+        { SeDebugPrivilege, debug_privilege_enabled() ? SE_PRIVILEGE_ENABLED : 0 },
         { SeSystemEnvironmentPrivilege, 0 },
         { SeSystemProfilePrivilege, 0 },
         { SeProfileSingleProcessPrivilege, 0 },
@@ -909,13 +909,28 @@ int token_check_privileges( struct token *token, int all_required, const struct 
         return (enabled_count > 0);
 }
 
+/* WINE_SERVICE_TOKEN=1 enables SeDebugPrivilege in the default token and lets
+ * it bypass process and thread DACLs. Without it neither happens, as in
+ * upstream Wine. */
+int debug_privilege_enabled( void )
+{
+    static int enabled = -1;
+
+    if (enabled == -1)
+    {
+        const char *str = getenv( "WINE_SERVICE_TOKEN" );
+        enabled = str && str[0] == '1' && !str[1];
+    }
+    return enabled;
+}
+
 /* whether the calling thread's token has SeDebugPrivilege enabled */
 int token_has_debug_privilege( void )
 {
     const struct luid_attr debug_priv = { SeDebugPrivilege, 0 };
     struct token *token = current->token ? current->token : current->process->token;
 
-    if (!token) return 0;
+    if (!debug_privilege_enabled() || !token) return 0;
     return token_check_privileges( token, TRUE, &debug_priv, 1, NULL );
 }
 
