@@ -330,6 +330,25 @@ C_ASSERT( HEAP_MIN_LARGE_BLOCK_SIZE <= HEAP_INITIAL_GROW_SIZE );
 
 static struct heap *process_heap;  /* main process heap */
 
+/* WINE_HEAP_BIN_SKIP=1: find_free_block checks at most 8 blocks of the request's own free
+ * list, then moves on to the next list, where every block is large enough. Without it,
+ * a list full of blocks that are just too small is walked to the end on every allocation.
+ * Backblaze's bztransmit spent about 75% of its CPU in that walk while it read its upload
+ * history. -1 means not read yet; RtlCreateHeap reads it, outside any heap lock. */
+static int heap_bin_skip = -1;
+
+static void read_heap_bin_skip(void)
+{
+    UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINE_HEAP_BIN_SKIP" ), value;
+    WCHAR buffer[4];
+
+    value.Length = 0;
+    value.MaximumLength = sizeof(buffer);
+    value.Buffer = buffer;
+    heap_bin_skip = !RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                    value.Length && buffer[0] != '0';
+}
+
 static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block );
 
 /* check if memory range a contains memory range b */
@@ -1108,11 +1127,17 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 
 static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
 {
-    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
+    unsigned int index = get_free_list_index( block_size );
+    struct list *ptr = &heap->free_lists[index].entry, *next_list = NULL;
+    unsigned int tries = 0;
     struct entry *entry;
     struct block *block;
     SIZE_T total_size;
     SUBHEAP *subheap;
+
+    /* Blocks in the following lists are all at least as large as the request. The last
+     * list has no upper bound, so there is nothing to skip to from it. */
+    if (heap_bin_skip > 0 && index + 1 < FREE_LIST_COUNT) next_list = &heap->free_lists[index + 1].entry;
 
     /* Find a suitable free list, and in it find a block large enough */
 
@@ -1120,12 +1145,21 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
     {
         entry = LIST_ENTRY( ptr, struct entry, entry );
         block = &entry->block;
-        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
+        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK)
+        {
+            if (ptr == next_list) next_list = NULL;
+            continue;
+        }
         if (block_get_size( block ) >= block_size)
         {
             if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size )) return NULL;
             list_remove( &entry->entry );
             return block;
+        }
+        if (next_list && ++tries >= 8)
+        {
+            ptr = next_list;
+            next_list = NULL;
         }
     }
 
@@ -1507,6 +1541,8 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
 
     TRACE( "flags %#lx, addr %p, total_size %#Ix, commit_size %#Ix, lock %p, params %p\n",
            flags, addr, total_size, commit_size, lock, params );
+
+    if (heap_bin_skip < 0 && process_heap) read_heap_bin_skip();
 
     flags &= ~(HEAP_TAIL_CHECKING_ENABLED|HEAP_FREE_CHECKING_ENABLED);
     if (process_heap) flags |= HEAP_PRIVATE;
