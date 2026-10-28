@@ -1882,8 +1882,8 @@ char *dup_fd_name( struct fd *root, const char *name )
 /* WINE_REALPATH_CACHE=1 keeps the resolved names of recently used directories for one
  * second. realpath() calls readlink() on every path component, and on a network mount each
  * of those can mean a round trip, all done in this single-threaded server. With the cache, a
- * file in a known directory costs one lstat(). A symlink as the last component still goes
- * through realpath(), and a rename clears the cache. */
+ * file in a known directory costs one lstat(). A symlink as the last component is cached
+ * under its own name, and a rename clears the cache. */
 #define REALPATH_CACHE_SIZE 256
 static struct
 {
@@ -1905,52 +1905,77 @@ static void clear_realpath_cache(void)
     }
 }
 
+/* realpath() of the first len bytes of path, through the cache; NULL on failure */
+static const char *lookup_realpath( const char *path, size_t len )
+{
+    unsigned int hash = 0;
+    char *key, *real;
+    size_t n;
+    int i;
+
+    for (n = 0; n < len; n++) hash = hash * 31 + (unsigned char)path[n];
+    i = hash % REALPATH_CACHE_SIZE;
+    if (realpath_cache[i].dir && current_time - realpath_cache[i].time <= TICKS_PER_SEC &&
+        strlen( realpath_cache[i].dir ) == len && !memcmp( realpath_cache[i].dir, path, len ))
+        return realpath_cache[i].real;
+
+    if (!(key = malloc( len + 1 ))) return NULL;
+    memcpy( key, path, len );
+    key[len] = 0;
+    if (!(real = realpath( key, NULL )))
+    {
+        free( key );
+        return NULL;
+    }
+    free( realpath_cache[i].dir );
+    free( realpath_cache[i].real );
+    realpath_cache[i].dir = key;
+    realpath_cache[i].real = real;
+    realpath_cache[i].time = current_time;
+    return real;
+}
+
 static char *cached_realpath( const char *path )
 {
-    const char *base, *str;
-    unsigned int hash = 0;
-    size_t dir_len;
+    const char *base, *real, *str;
+    size_t len, dir_len, base_len;
     struct stat st;
-    char *ret, *real;
-    int i;
+    char *name, *ret;
+    int ok;
 
     if (realpath_cache_enabled == -1)
         realpath_cache_enabled = (str = getenv( "WINE_REALPATH_CACHE" )) && atoi( str );
     if (!realpath_cache_enabled || path[0] != '/') return realpath( path, NULL );
 
-    base = strrchr( path, '/' ) + 1;
+    /* a directory may be opened as "dir/"; look at the name without the slashes */
+    len = strlen( path );
+    while (len > 1 && path[len - 1] == '/') len--;
+    for (base = path + len; base[-1] != '/'; base--) ;
+    base_len = path + len - base;
     dir_len = base - 1 - path;
-    if (!dir_len || !base[0] || !strcmp( base, "." ) || !strcmp( base, ".." ))
+    if (!dir_len || !base_len || (base_len == 1 && base[0] == '.') ||
+        (base_len == 2 && base[0] == '.' && base[1] == '.'))
         return realpath( path, NULL );
-    if (lstat( path, &st ) || S_ISLNK( st.st_mode )) return realpath( path, NULL );
 
-    for (str = path; str < path + dir_len; str++) hash = hash * 31 + (unsigned char)*str;
-    i = hash % REALPATH_CACHE_SIZE;
-    if (!realpath_cache[i].dir || current_time - realpath_cache[i].time > TICKS_PER_SEC ||
-        strlen( realpath_cache[i].dir ) != dir_len || memcmp( realpath_cache[i].dir, path, dir_len ))
+    if (!(name = malloc( len + 1 ))) return NULL;
+    memcpy( name, path, len );
+    name[len] = 0;
+    ok = !lstat( name, &st );
+    free( name );
+    if (!ok) return realpath( path, NULL );
+
+    /* a symlink, such as a drive letter in dosdevices, is cached under its own name */
+    if (S_ISLNK( st.st_mode ))
     {
-        char *dir = malloc( dir_len + 1 );
-
-        if (!dir) return NULL;
-        memcpy( dir, path, dir_len );
-        dir[dir_len] = 0;
-        if (!(real = realpath( dir, NULL )))
-        {
-            free( dir );
-            return realpath( path, NULL );
-        }
-        free( realpath_cache[i].dir );
-        free( realpath_cache[i].real );
-        realpath_cache[i].dir = dir;
-        realpath_cache[i].real = real;
-        realpath_cache[i].time = current_time;
+        if (!(real = lookup_realpath( path, len ))) return realpath( path, NULL );
+        return strdup( real );
     }
 
-    real = realpath_cache[i].real;
-    if (!(ret = malloc( strlen( real ) + strlen( base ) + 2 ))) return NULL;
+    if (!(real = lookup_realpath( path, dir_len ))) return realpath( path, NULL );
+    if (!(ret = malloc( strlen( real ) + base_len + 2 ))) return NULL;
     strcpy( ret, real );
     if (strcmp( real, "/" )) strcat( ret, "/" );
-    strcat( ret, base );
+    strncat( ret, base, base_len );
     return ret;
 }
 
