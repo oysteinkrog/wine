@@ -460,6 +460,10 @@ static enum server_fd_type dir_get_fd_type( struct fd *fd )
 #ifdef HAVE_SYS_INOTIFY_H
 
 #define HASH_SIZE 31
+/* WINE_NOTIFY_HASH=1 spreads the inodes over this many buckets instead. A recursive
+ * watch on a large tree holds one inode per directory, and with 31 buckets each
+ * lookup then walks thousands of list entries. */
+#define BIG_HASH_SIZE 65521
 
 struct inode {
     struct list ch_entry;    /* entry in the children list */
@@ -474,14 +478,15 @@ struct inode {
     char *name;              /* basename name of the inode */
 };
 
-static struct list inode_hash[ HASH_SIZE ];
-static struct list wd_hash[ HASH_SIZE ];
+static struct list inode_hash[ BIG_HASH_SIZE ];
+static struct list wd_hash[ BIG_HASH_SIZE ];
+static unsigned int hash_size = HASH_SIZE;
 
 static int inotify_add_dir( char *path, unsigned int filter );
 
 static struct inode *inode_from_wd( int wd )
 {
-    struct list *bucket = &wd_hash[ wd % HASH_SIZE ];
+    struct list *bucket = &wd_hash[ wd % hash_size ];
     struct inode *inode;
 
     LIST_FOR_EACH_ENTRY( inode, bucket, struct inode, wd_entry )
@@ -493,7 +498,7 @@ static struct inode *inode_from_wd( int wd )
 
 static inline struct list *get_hash_list( dev_t dev, ino_t ino )
 {
-    return &inode_hash[ (ino ^ dev) % HASH_SIZE ];
+    return &inode_hash[ (ino ^ dev) % hash_size ];
 }
 
 static struct inode *find_inode( dev_t dev, ino_t ino )
@@ -542,7 +547,7 @@ static void inode_set_wd( struct inode *inode, int wd )
     if (inode->wd != -1)
         list_remove( &inode->wd_entry );
     inode->wd = wd;
-    list_add_tail( &wd_hash[ wd % HASH_SIZE ], &inode->wd_entry );
+    list_add_tail( &wd_hash[ wd % hash_size ], &inode->wd_entry );
 }
 
 static void inode_set_name( struct inode *inode, const char *name )
@@ -945,7 +950,8 @@ static int inotify_add_dir( char *path, unsigned int filter )
 
 static int init_inotify( void )
 {
-    int i;
+    const char *str;
+    unsigned int i;
 
     if (inotify_fd)
         return 1;
@@ -954,7 +960,8 @@ static int init_inotify( void )
     if (!inotify_fd)
         return 0;
 
-    for (i=0; i<HASH_SIZE; i++)
+    if ((str = getenv( "WINE_NOTIFY_HASH" )) && atoi( str )) hash_size = BIG_HASH_SIZE;
+    for (i=0; i<hash_size; i++)
     {
         list_init( &inode_hash[i] );
         list_init( &wd_hash[i] );
