@@ -1879,6 +1879,81 @@ char *dup_fd_name( struct fd *root, const char *name )
     return ret;
 }
 
+/* WINE_REALPATH_CACHE=1 keeps the resolved names of recently used directories for one
+ * second. realpath() calls readlink() on every path component, and on a network mount each
+ * of those can mean a round trip, all done in this single-threaded server. With the cache, a
+ * file in a known directory costs one lstat(). A symlink as the last component still goes
+ * through realpath(), and a rename clears the cache. */
+#define REALPATH_CACHE_SIZE 256
+static struct
+{
+    char      *dir;
+    char      *real;
+    timeout_t  time;
+} realpath_cache[REALPATH_CACHE_SIZE];
+static int realpath_cache_enabled = -1;
+
+static void clear_realpath_cache(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < REALPATH_CACHE_SIZE; i++)
+    {
+        free( realpath_cache[i].dir );
+        free( realpath_cache[i].real );
+        realpath_cache[i].dir = realpath_cache[i].real = NULL;
+    }
+}
+
+static char *cached_realpath( const char *path )
+{
+    const char *base, *str;
+    unsigned int hash = 0;
+    size_t dir_len;
+    struct stat st;
+    char *ret, *real;
+    int i;
+
+    if (realpath_cache_enabled == -1)
+        realpath_cache_enabled = (str = getenv( "WINE_REALPATH_CACHE" )) && atoi( str );
+    if (!realpath_cache_enabled || path[0] != '/') return realpath( path, NULL );
+
+    base = strrchr( path, '/' ) + 1;
+    dir_len = base - 1 - path;
+    if (!dir_len || !base[0] || !strcmp( base, "." ) || !strcmp( base, ".." ))
+        return realpath( path, NULL );
+    if (lstat( path, &st ) || S_ISLNK( st.st_mode )) return realpath( path, NULL );
+
+    for (str = path; str < path + dir_len; str++) hash = hash * 31 + (unsigned char)*str;
+    i = hash % REALPATH_CACHE_SIZE;
+    if (!realpath_cache[i].dir || current_time - realpath_cache[i].time > TICKS_PER_SEC ||
+        strlen( realpath_cache[i].dir ) != dir_len || memcmp( realpath_cache[i].dir, path, dir_len ))
+    {
+        char *dir = malloc( dir_len + 1 );
+
+        if (!dir) return NULL;
+        memcpy( dir, path, dir_len );
+        dir[dir_len] = 0;
+        if (!(real = realpath( dir, NULL )))
+        {
+            free( dir );
+            return realpath( path, NULL );
+        }
+        free( realpath_cache[i].dir );
+        free( realpath_cache[i].real );
+        realpath_cache[i].dir = dir;
+        realpath_cache[i].real = real;
+        realpath_cache[i].time = current_time;
+    }
+
+    real = realpath_cache[i].real;
+    if (!(ret = malloc( strlen( real ) + strlen( base ) + 2 ))) return NULL;
+    strcpy( ret, real );
+    if (strcmp( real, "/" )) strcat( ret, "/" );
+    strcat( ret, base );
+    return ret;
+}
+
 static WCHAR *dup_nt_name( struct fd *root, struct unicode_str name, data_size_t *len )
 {
     WCHAR *ptr, *ret;
@@ -2014,7 +2089,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
 
         if ((path = dup_fd_name( root, name )))
         {
-            fd->unix_name = realpath( path, NULL );
+            fd->unix_name = cached_realpath( path );
             free( path );
         }
 
@@ -2897,6 +2972,7 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
     free( fd->nt_name );
     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
     free( fd->unix_name );
+    clear_realpath_cache();
     fd->closed->unix_name = fd->unix_name = realpath( name, NULL );
     free( name );
     if (!fd->unix_name)
