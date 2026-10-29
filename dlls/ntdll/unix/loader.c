@@ -499,6 +499,155 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
 }
 
 
+/* copy environ into a new array, leaving out the names set in extra[], then append extra[] */
+static char **build_spawn_env( char **extra, int count )
+{
+    char **env;
+    int i, j, n = 0;
+
+    for (i = 0; environ[i]; i++) n++;
+    if (!(env = malloc( (n + count + 1) * sizeof(*env) ))) return NULL;
+    for (i = n = 0; environ[i]; i++)
+    {
+        for (j = 0; j < count; j++)
+        {
+            size_t len = strchr( extra[j], '=' ) - extra[j] + 1;
+            if (!strncmp( environ[i], extra[j], len )) break;
+        }
+        if (j == count) env[n++] = environ[i];
+    }
+    for (j = 0; j < count; j++) env[n++] = extra[j];
+    env[n] = NULL;
+    return env;
+}
+
+/***********************************************************************
+ *           spawn_wineloader_nocopy
+ *
+ * WINE_SPAWN_NOCOPY=1 starts the new process with vfork() and posix_spawn() instead of
+ * fork() twice. fork() copies the parent's page tables, which takes hundreds of
+ * milliseconds per process when the parent has gigabytes swapped out. The vfork() child
+ * only calls posix_spawn() and exits, so the new process is still reparented as before.
+ * Does the same as the grandchild in spawn_process() plus exec_wineloader().
+ * Returns -1 when the switch is off or a step cannot be prepared, so the caller forks.
+ */
+int spawn_wineloader_nocopy( char **argv, int socketfd, const struct pe_image_info *pe_info,
+                             int stdin_fd, int stdout_fd, BOOL new_session, int unixdir,
+                             char *winedebug )
+{
+#if defined(HAVE_WINE_PRELOADER) && defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 29)
+    static int enabled = -1;
+    static char noexec[] = "WINELOADERNOEXEC=1";
+    WORD machine = pe_info->machine;
+    ULONGLONG res_start = pe_info->base;
+    ULONGLONG res_end = pe_info->base + pe_info->map_size;
+    char preloader_reserve[64], socket_env[64], *extra[4], **env;
+    char *paths[4], **args[4], *alt;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    sigset_t all, old, def;
+    int i, argc, count = 0, nb_extra = 0, ret = -1;
+    pid_t pid, wret;
+    const char *str;
+
+    if (enabled == -1) enabled = (str = getenv( "WINE_SPAWN_NOCOPY" )) && atoi( str );
+    if (!enabled) return -1;
+
+    if (pe_info->wine_fakedll) res_start = res_end = 0;
+    if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady)
+        machine = is_machine_64bit( native_machine ) ? IMAGE_FILE_MACHINE_AMD64 : native_machine;
+
+    snprintf( socket_env, sizeof(socket_env), "WINESERVERSOCKET=%u", socketfd );
+    snprintf( preloader_reserve, sizeof(preloader_reserve), "WINEPRELOADRESERVE=%x%08x-%x%08x",
+             (UINT)(res_start >> 32), (UINT)res_start, (UINT)(res_end >> 32), (UINT)res_end );
+    extra[nb_extra++] = preloader_reserve;
+    extra[nb_extra++] = socket_env;
+    extra[nb_extra++] = noexec;
+    if (winedebug) extra[nb_extra++] = winedebug;
+    if (!(env = build_spawn_env( extra, nb_extra ))) return -1;
+
+    /* the same order loader_exec() tries: alternate loader, then the default one,
+     * each through its preloader first */
+    for (argc = 2; argv[argc]; argc++) ;
+    alt = get_alternate_wineloader( machine );
+    for (i = 0; i < 2; i++)
+    {
+        const char *loader = i ? wineloader : alt;
+        char **a;
+
+        if (!loader) continue;
+        if (!(a = malloc( (argc + 1) * sizeof(*a) ))) goto done;
+        memcpy( a, argv, (argc + 1) * sizeof(*a) );
+        a[1] = (char *)loader;
+        if (asprintf( &a[0], "%s-preloader", loader ) == -1) { free( a ); goto done; }
+        paths[count] = a[0];
+        args[count++] = a;
+        paths[count] = a[1];
+        args[count++] = a + 1;
+    }
+
+    posix_spawn_file_actions_init( &actions );
+    posix_spawnattr_init( &attr );
+    if (new_session || stdin_fd == -1)
+        posix_spawn_file_actions_addopen( &actions, 0, "/dev/null", O_RDWR, 0 );
+    else if (stdin_fd != 0)
+        posix_spawn_file_actions_adddup2( &actions, stdin_fd, 0 );
+    if (new_session || stdout_fd == -1)
+        posix_spawn_file_actions_addopen( &actions, 1, "/dev/null", O_RDWR, 0 );
+    else if (stdout_fd != 1)
+        posix_spawn_file_actions_adddup2( &actions, stdout_fd, 1 );
+    /* these come from dup() without FD_CLOEXEC; spawn_process() closes them in the child too */
+    if (stdin_fd > 1) posix_spawn_file_actions_addclose( &actions, stdin_fd );
+    if (stdout_fd > 1 && stdout_fd != stdin_fd) posix_spawn_file_actions_addclose( &actions, stdout_fd );
+    if (unixdir != -1)
+    {
+        posix_spawn_file_actions_addfchdir_np( &actions, unixdir );
+        posix_spawn_file_actions_addclose( &actions, unixdir );
+    }
+
+    sigfillset( &all );
+    pthread_sigmask( SIG_BLOCK, &all, &old );
+    sigemptyset( &def );
+    sigaddset( &def, SIGPIPE );
+    posix_spawnattr_setsigdefault( &attr, &def );
+    posix_spawnattr_setsigmask( &attr, &old );
+    posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK |
+                              (new_session ? POSIX_SPAWN_SETSID : 0) );
+
+    /* all signals are blocked, so no Wine handler runs on the shared memory */
+    if (!(pid = vfork()))
+    {
+        pid_t child;
+        for (i = 0; i < count; i++)
+            if (!posix_spawn( &child, paths[i], &actions, &attr, args[i], env )) _exit(0);
+        _exit(1);
+    }
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+
+    if (pid != -1)
+    {
+        do wret = waitpid( pid, NULL, 0 ); while (wret < 0 && errno == EINTR);
+        ret = 0;
+    }
+    else ret = 1;
+
+    posix_spawn_file_actions_destroy( &actions );
+    posix_spawnattr_destroy( &attr );
+done:
+    for (i = 0; i < count; i += 2)
+    {
+        free( paths[i] );
+        free( args[i] );
+    }
+    free( alt );
+    free( env );
+    return ret;
+#else
+    return -1;
+#endif
+}
+
+
 /***********************************************************************
  *           exec_wineserver
  *

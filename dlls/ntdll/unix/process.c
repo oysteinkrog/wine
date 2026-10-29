@@ -415,6 +415,25 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
 
+    if ((argv = build_argv( &params->CommandLine, 2 )))
+    {
+        BOOL new_session = (peb && peb->ProcessParameters &&
+                            params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+                           params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+                           params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+                           params->ConsoleHandle == NULL;
+        int ret = spawn_wineloader_nocopy( argv, socketfd, pe_info, stdin_fd, stdout_fd,
+                                           new_session, unixdir, winedebug );
+        free( argv );
+        if (ret != -1)
+        {
+            if (ret) status = STATUS_NO_MEMORY;
+            if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
+            if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
+            return status;
+        }
+    }
+
     if (!(pid = fork()))  /* child */
     {
         if (!(pid = fork()))  /* grandchild */
