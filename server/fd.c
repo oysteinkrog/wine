@@ -2795,6 +2795,32 @@ static struct fd *get_handle_fd_obj( struct process *process, obj_handle_t handl
     return fd;
 }
 
+/* WINE_REPLACE_READ_ONLY_OPEN=1 lets a rename replace a file that other handles have open
+ * only for reading. Windows refuses this, but on Unix the readers keep the old file, so
+ * nothing is lost. The Backblaze client rewrites its status files through a .tmp file many
+ * times a second while its UI and service read them, and each refused rename made it sleep
+ * 250 ms before retrying. */
+static int replace_read_only_open(void)
+{
+    static int enabled = -1;
+    const char *str;
+
+    if (enabled == -1) enabled = (str = getenv( "WINE_REPLACE_READ_ONLY_OPEN" )) && atoi( str );
+    return enabled;
+}
+
+static int only_readers_open( struct inode *inode )
+{
+    struct fd *fd;
+
+    LIST_FOR_EACH_ENTRY( fd, &inode->open, struct fd, inode_entry )
+    {
+        if (fd->access & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) return 0;
+        if (fd->options & FILE_DELETE_ON_CLOSE) return 0;
+    }
+    return 1;
+}
+
 /* set disposition for the fd */
 static void set_fd_disposition( struct fd *fd, unsigned int flags )
 {
@@ -2949,9 +2975,10 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
         /* can't replace an opened file */
         if ((inode = get_inode( st.st_dev, st.st_ino, -1 )))
         {
-            int is_empty = list_empty( &inode->open );
+            int is_busy = !list_empty( &inode->open );
+            if (is_busy && replace_read_only_open()) is_busy = !only_readers_open( inode );
             release_object( inode );
-            if (!is_empty)
+            if (is_busy)
             {
                 set_error( STATUS_ACCESS_DENIED );
                 goto failed;
