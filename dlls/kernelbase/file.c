@@ -2119,6 +2119,69 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetLongPathNameA( LPCSTR shortpath, LPSTR longpat
 }
 
 
+/* WINE_LONGPATH_CACHE=1 remembers, for one second, what each path prefix resolved to.
+ * GetLongPathNameW checks every component with FindFirstFileW, which costs several server
+ * calls each. Backblaze calls it many times per file it backs up, mostly on the same few
+ * directories. A component that was not found is never cached. */
+#define LONGPATH_CACHE_SIZE 256
+static struct
+{
+    WCHAR    *key;
+    WCHAR    *value;
+    ULONGLONG time;
+} longpath_cache[LONGPATH_CACHE_SIZE];
+static SRWLOCK longpath_lock = SRWLOCK_INIT;
+static int longpath_cache_enabled = -1;
+
+static unsigned int longpath_hash( const WCHAR *str, DWORD len )
+{
+    unsigned int hash = 0;
+    while (len--) hash = hash * 31 + *str++;
+    return hash % LONGPATH_CACHE_SIZE;
+}
+
+/* copy the cached result for the first len chars of key into buf; returns its length or 0 */
+static DWORD longpath_cache_get( const WCHAR *key, DWORD len, WCHAR *buf, DWORD buflen )
+{
+    unsigned int i = longpath_hash( key, len );
+    DWORD ret = 0, vlen;
+
+    AcquireSRWLockShared( &longpath_lock );
+    if (longpath_cache[i].key && GetTickCount64() - longpath_cache[i].time < 1000 &&
+        lstrlenW( longpath_cache[i].key ) == len && !memcmp( longpath_cache[i].key, key, len * sizeof(WCHAR) ) &&
+        (vlen = lstrlenW( longpath_cache[i].value )) < buflen)
+    {
+        memcpy( buf, longpath_cache[i].value, (vlen + 1) * sizeof(WCHAR) );
+        ret = vlen;
+    }
+    ReleaseSRWLockShared( &longpath_lock );
+    return ret;
+}
+
+static void longpath_cache_put( const WCHAR *key, DWORD len, const WCHAR *value, DWORD vlen )
+{
+    unsigned int i = longpath_hash( key, len );
+    WCHAR *k, *v;
+
+    if (!(k = HeapAlloc( GetProcessHeap(), 0, (len + 1) * sizeof(WCHAR) ))) return;
+    if (!(v = HeapAlloc( GetProcessHeap(), 0, (vlen + 1) * sizeof(WCHAR) )))
+    {
+        HeapFree( GetProcessHeap(), 0, k );
+        return;
+    }
+    memcpy( k, key, len * sizeof(WCHAR) );
+    k[len] = 0;
+    memcpy( v, value, vlen * sizeof(WCHAR) );
+    v[vlen] = 0;
+    AcquireSRWLockExclusive( &longpath_lock );
+    HeapFree( GetProcessHeap(), 0, longpath_cache[i].key );
+    HeapFree( GetProcessHeap(), 0, longpath_cache[i].value );
+    longpath_cache[i].key = k;
+    longpath_cache[i].value = v;
+    longpath_cache[i].time = GetTickCount64();
+    ReleaseSRWLockExclusive( &longpath_lock );
+}
+
 /***********************************************************************
  *	GetLongPathNameW   (kernelbase.@)
  */
@@ -2194,6 +2257,23 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetLongPathNameW( LPCWSTR shortpath, LPWSTR longp
             }
         }
 
+        if (longpath_cache_enabled == -1)
+        {
+            WCHAR env[4];
+            longpath_cache_enabled = GetEnvironmentVariableW( L"WINE_LONGPATH_CACHE", env, ARRAY_SIZE(env) ) &&
+                                     env[0] != '0';
+        }
+        if (longpath_cache_enabled)
+        {
+            DWORD len = longpath_cache_get( shortpath, sp + tmplen, tmplongpath, ARRAY_SIZE(tmplongpath) );
+            if (len)
+            {
+                lp = len;
+                sp += tmplen;
+                continue;
+            }
+        }
+
         /* Check if the file exists */
         handle = FindFirstFileW( tmplongpath, &wfd );
         if (handle == INVALID_HANDLE_VALUE)
@@ -2209,6 +2289,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetLongPathNameW( LPCWSTR shortpath, LPWSTR longp
         if (RtlIsNameLegalDOS8Dot3( &nameW, NULL, NULL )) lstrcpyW( tmplongpath + lp, wfd.cFileName );
         lp += lstrlenW( tmplongpath + lp );
         sp += tmplen;
+        if (longpath_cache_enabled) longpath_cache_put( shortpath, sp, tmplongpath, lp );
     }
     tmplen = lstrlenW( shortpath ) - 1;
     if ((shortpath[tmplen] == '/' || shortpath[tmplen] == '\\') &&
