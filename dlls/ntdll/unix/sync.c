@@ -2416,12 +2416,34 @@ NTSTATUS WINAPI NtYieldExecution(void)
 }
 
 
+/* WINE_SHORTEN_SLEEP=<from>:<to> turns a non-alertable sleep of exactly <from> ms into one of
+ * <to> ms. The Backblaze client pauses 4 seconds between chunks when it reads its own large
+ * files ("to lighten disk I/O"); under this service it already runs at idle I/O priority,
+ * and the pauses added minutes to every backup pass. */
+static LONGLONG shorten_sleep_from, shorten_sleep_to;
+
+static void init_shorten_sleep(void)
+{
+    static int done;
+    const char *str;
+    unsigned int from, to;
+
+    if (done) return;
+    if ((str = getenv( "WINE_SHORTEN_SLEEP" )) && sscanf( str, "%u:%u", &from, &to ) == 2 && to < from)
+    {
+        shorten_sleep_from = -(LONGLONG)from * 10000;
+        shorten_sleep_to = -(LONGLONG)to * 10000;
+    }
+    done = 1;
+}
+
 /******************************************************************
  *		NtDelayExecution (NTDLL.@)
  */
 NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
     unsigned int status = STATUS_SUCCESS;
+    LARGE_INTEGER shortened;
 
     /* if alertable, we need to query the server */
     if (alertable)
@@ -2441,6 +2463,13 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
     {
         LARGE_INTEGER now;
         timeout_t when, diff;
+
+        init_shorten_sleep();
+        if (shorten_sleep_from && timeout->QuadPart == shorten_sleep_from)
+        {
+            shortened.QuadPart = shorten_sleep_to;
+            timeout = &shortened;
+        }
 
         if ((when = timeout->QuadPart) < 0)
         {
