@@ -36,6 +36,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#ifdef __linux__
+# include <sched.h>
+# include <sys/syscall.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -499,6 +503,8 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
 }
 
 
+#if defined(__linux__) && defined(HAVE_WINE_PRELOADER)
+
 /* copy environ into a new array, leaving out the names set in extra[], then append extra[] */
 static char **build_spawn_env( char **extra, int count )
 {
@@ -521,41 +527,116 @@ static char **build_spawn_env( char **extra, int count )
     return env;
 }
 
+#define NOCOPY_STACK_SIZE 0x10000
+
+struct nocopy_spawn
+{
+    char      *paths[4];   /* exec candidates, in the order loader_exec() tries them */
+    char     **args[4];
+    int        count;
+    char     **env;
+    int        stdin_fd;
+    int        stdout_fd;
+    int        null_fd;
+    int        unixdir;
+    BOOL       new_session;
+    sigset_t   old_mask;
+    char      *stack;      /* two stacks: middle process, then the new process */
+};
+
+/* The new process. It shares the parent's memory until execve(), like the child in
+ * glibc's posix_spawn(), so it only makes system calls. It has its own copy of the
+ * signal handlers, since CLONE_SIGHAND is not set. */
+static int nocopy_exec( void *arg )
+{
+    struct nocopy_spawn *s = arg;
+    struct sigaction sa, dfl;
+    int i, in_fd, out_fd;
+
+    memset( &dfl, 0, sizeof(dfl) );
+    dfl.sa_handler = SIG_DFL;
+    for (i = 1; i < _NSIG; i++)
+    {
+        if (sigaction( i, NULL, &sa )) continue;
+        if (sa.sa_handler == SIG_DFL) continue;
+        if (sa.sa_handler == SIG_IGN && i != SIGPIPE) continue;
+        sigaction( i, &dfl, NULL );
+    }
+
+    if (s->new_session) setsid();
+    in_fd = s->new_session || s->stdin_fd == -1 ? s->null_fd : s->stdin_fd;
+    out_fd = s->new_session || s->stdout_fd == -1 ? s->null_fd : s->stdout_fd;
+    if (in_fd != 0) dup2( in_fd, 0 );
+    if (out_fd != 1) dup2( out_fd, 1 );
+    if (s->stdin_fd != -1 && s->stdin_fd != 0) close( s->stdin_fd );
+    if (s->stdout_fd != -1 && s->stdout_fd != 1) close( s->stdout_fd );
+
+    if (s->unixdir != -1)
+    {
+        fchdir( s->unixdir );
+        close( s->unixdir );
+    }
+
+    syscall( SYS_rt_sigprocmask, SIG_SETMASK, &s->old_mask, NULL, _NSIG / 8 );
+    for (i = 0; i < s->count; i++) execve( s->paths[i], s->args[i], s->env );
+    _exit(1);
+}
+
+/* The middle process: starts the new one and exits, so the new process gets reparented
+ * as with the double fork() in spawn_process(). */
+static int nocopy_middle( void *arg )
+{
+    struct nocopy_spawn *s = arg;
+    pid_t pid = clone( nocopy_exec, s->stack + 2 * NOCOPY_STACK_SIZE,
+                       CLONE_VM | CLONE_VFORK | SIGCHLD, s );
+    _exit( pid == -1 );
+}
+
+static int nocopy_enabled = -1;
+
+BOOL spawn_nocopy_enabled(void)
+{
+    const char *str;
+
+    if (nocopy_enabled == -1)
+        nocopy_enabled = (str = getenv( "WINE_SPAWN_NOCOPY" )) && atoi( str );
+    return nocopy_enabled;
+}
+
 /***********************************************************************
  *           spawn_wineloader_nocopy
  *
- * WINE_SPAWN_NOCOPY=1 starts the new process with vfork() and posix_spawn() instead of
- * fork() twice. fork() copies the parent's page tables, which takes hundreds of
- * milliseconds per process when the parent has gigabytes swapped out. The vfork() child
- * only calls posix_spawn() and exits, so the new process is still reparented as before.
- * Does the same as the grandchild in spawn_process() plus exec_wineloader().
- * Returns -1 when the switch is off or a step cannot be prepared, so the caller forks.
+ * WINE_SPAWN_NOCOPY=1 starts a new process with clone(CLONE_VM | CLONE_VFORK) twice
+ * instead of fork() twice. fork() copies the parent's page tables, which takes hundreds
+ * of milliseconds per process when the parent has gigabytes swapped out. Does the same
+ * as the grandchild in spawn_process() plus exec_wineloader(). Returns -1 when the spawn
+ * cannot be prepared, so the caller falls back to fork().
  */
 int spawn_wineloader_nocopy( char **argv, int socketfd, const struct pe_image_info *pe_info,
                              int stdin_fd, int stdout_fd, BOOL new_session, int unixdir,
                              char *winedebug )
 {
-#if defined(HAVE_WINE_PRELOADER) && defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 29)
-    static int enabled = -1;
     static char noexec[] = "WINELOADERNOEXEC=1";
     WORD machine = pe_info->machine;
     ULONGLONG res_start = pe_info->base;
     ULONGLONG res_end = pe_info->base + pe_info->map_size;
-    char preloader_reserve[64], socket_env[64], *extra[4], **env;
-    char *paths[4], **args[4], *alt;
-    posix_spawn_file_actions_t actions;
-    posix_spawnattr_t attr;
-    sigset_t all, old, def;
-    int i, argc, count = 0, nb_extra = 0, ret = -1;
+    char preloader_reserve[64], socket_env[64], *extra[4], *alt;
+    struct nocopy_spawn s;
+    sigset_t all;
+    int i, argc, nb_extra = 0, ret = -1;
     pid_t pid, wret;
-    const char *str;
-
-    if (enabled == -1) enabled = (str = getenv( "WINE_SPAWN_NOCOPY" )) && atoi( str );
-    if (!enabled) return -1;
 
     if (pe_info->wine_fakedll) res_start = res_end = 0;
     if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady)
         machine = is_machine_64bit( native_machine ) ? IMAGE_FILE_MACHINE_AMD64 : native_machine;
+
+    memset( &s, 0, sizeof(s) );
+    s.stdin_fd = stdin_fd;
+    s.stdout_fd = stdout_fd;
+    s.unixdir = unixdir;
+    s.new_session = new_session;
+    s.null_fd = -1;
+    s.stack = MAP_FAILED;
 
     snprintf( socket_env, sizeof(socket_env), "WINESERVERSOCKET=%u", socketfd );
     snprintf( preloader_reserve, sizeof(preloader_reserve), "WINEPRELOADRESERVE=%x%08x-%x%08x",
@@ -564,10 +645,8 @@ int spawn_wineloader_nocopy( char **argv, int socketfd, const struct pe_image_in
     extra[nb_extra++] = socket_env;
     extra[nb_extra++] = noexec;
     if (winedebug) extra[nb_extra++] = winedebug;
-    if (!(env = build_spawn_env( extra, nb_extra ))) return -1;
+    if (!(s.env = build_spawn_env( extra, nb_extra ))) return -1;
 
-    /* the same order loader_exec() tries: alternate loader, then the default one,
-     * each through its preloader first */
     for (argc = 2; argv[argc]; argc++) ;
     alt = get_alternate_wineloader( machine );
     for (i = 0; i < 2; i++)
@@ -580,49 +659,26 @@ int spawn_wineloader_nocopy( char **argv, int socketfd, const struct pe_image_in
         memcpy( a, argv, (argc + 1) * sizeof(*a) );
         a[1] = (char *)loader;
         if (asprintf( &a[0], "%s-preloader", loader ) == -1) { free( a ); goto done; }
-        paths[count] = a[0];
-        args[count++] = a;
-        paths[count] = a[1];
-        args[count++] = a + 1;
+        s.paths[s.count] = a[0];
+        s.args[s.count++] = a;
+        s.paths[s.count] = a[1];
+        s.args[s.count++] = a + 1;
     }
 
-    posix_spawn_file_actions_init( &actions );
-    posix_spawnattr_init( &attr );
-    if (new_session || stdin_fd == -1)
-        posix_spawn_file_actions_addopen( &actions, 0, "/dev/null", O_RDWR, 0 );
-    else if (stdin_fd != 0)
-        posix_spawn_file_actions_adddup2( &actions, stdin_fd, 0 );
-    if (new_session || stdout_fd == -1)
-        posix_spawn_file_actions_addopen( &actions, 1, "/dev/null", O_RDWR, 0 );
-    else if (stdout_fd != 1)
-        posix_spawn_file_actions_adddup2( &actions, stdout_fd, 1 );
-    /* these come from dup() without FD_CLOEXEC; spawn_process() closes them in the child too */
-    if (stdin_fd > 1) posix_spawn_file_actions_addclose( &actions, stdin_fd );
-    if (stdout_fd > 1 && stdout_fd != stdin_fd) posix_spawn_file_actions_addclose( &actions, stdout_fd );
-    if (unixdir != -1)
+    if (new_session || stdin_fd == -1 || stdout_fd == -1)
     {
-        posix_spawn_file_actions_addfchdir_np( &actions, unixdir );
-        posix_spawn_file_actions_addclose( &actions, unixdir );
+        if ((s.null_fd = open( "/dev/null", O_RDWR | O_CLOEXEC )) == -1) goto done;
     }
+    s.stack = mmap( NULL, 2 * NOCOPY_STACK_SIZE, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0 );
+    if (s.stack == MAP_FAILED) goto done;
 
+    /* block every signal, glibc's own included, so no handler runs in the children
+     * while they share this memory */
     sigfillset( &all );
-    pthread_sigmask( SIG_BLOCK, &all, &old );
-    sigemptyset( &def );
-    sigaddset( &def, SIGPIPE );
-    posix_spawnattr_setsigdefault( &attr, &def );
-    posix_spawnattr_setsigmask( &attr, &old );
-    posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK |
-                              (new_session ? POSIX_SPAWN_SETSID : 0) );
-
-    /* all signals are blocked, so no Wine handler runs on the shared memory */
-    if (!(pid = vfork()))
-    {
-        pid_t child;
-        for (i = 0; i < count; i++)
-            if (!posix_spawn( &child, paths[i], &actions, &attr, args[i], env )) _exit(0);
-        _exit(1);
-    }
-    pthread_sigmask( SIG_SETMASK, &old, NULL );
+    syscall( SYS_rt_sigprocmask, SIG_SETMASK, &all, &s.old_mask, _NSIG / 8 );
+    pid = clone( nocopy_middle, s.stack + NOCOPY_STACK_SIZE, CLONE_VM | CLONE_VFORK | SIGCHLD, &s );
+    syscall( SYS_rt_sigprocmask, SIG_SETMASK, &s.old_mask, NULL, _NSIG / 8 );
 
     if (pid != -1)
     {
@@ -631,21 +687,34 @@ int spawn_wineloader_nocopy( char **argv, int socketfd, const struct pe_image_in
     }
     else ret = 1;
 
-    posix_spawn_file_actions_destroy( &actions );
-    posix_spawnattr_destroy( &attr );
 done:
-    for (i = 0; i < count; i += 2)
+    if (s.stack != MAP_FAILED) munmap( s.stack, 2 * NOCOPY_STACK_SIZE );
+    if (s.null_fd != -1) close( s.null_fd );
+    for (i = 0; i < s.count; i += 2)
     {
-        free( paths[i] );
-        free( args[i] );
+        free( s.paths[i] );
+        free( s.args[i] );
     }
     free( alt );
-    free( env );
+    free( s.env );
     return ret;
-#else
-    return -1;
-#endif
 }
+
+#else
+
+BOOL spawn_nocopy_enabled(void)
+{
+    return FALSE;
+}
+
+int spawn_wineloader_nocopy( char **argv, int socketfd, const struct pe_image_info *pe_info,
+                             int stdin_fd, int stdout_fd, BOOL new_session, int unixdir,
+                             char *winedebug )
+{
+    return -1;
+}
+
+#endif
 
 
 /***********************************************************************

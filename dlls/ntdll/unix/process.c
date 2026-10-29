@@ -415,7 +415,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
 
-    if ((argv = build_argv( &params->CommandLine, 2 )))
+    if (spawn_nocopy_enabled() && (argv = build_argv( &params->CommandLine, 2 )))
     {
         BOOL new_session = (peb && peb->ProcessParameters &&
                             params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||

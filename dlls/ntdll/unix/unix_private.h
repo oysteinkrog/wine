@@ -241,6 +241,7 @@ extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_
                                   const struct pe_image_info *pe_info, DWORD *info_size );
 extern char *get_alternate_wineloader( WORD machine );
 extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info );
+extern BOOL spawn_nocopy_enabled(void);
 extern int spawn_wineloader_nocopy( char **argv, int socketfd, const struct pe_image_info *pe_info,
                                     int stdin_fd, int stdout_fd, BOOL new_session, int unixdir,
                                     char *winedebug );
