@@ -2515,6 +2515,15 @@ static struct accept_req *alloc_accept_req( struct sock *sock, struct sock *acce
     return req;
 }
 
+static int sndbuf_autotune(void)
+{
+    static int enabled = -1;
+    const char *str;
+
+    if (enabled == -1) enabled = (str = getenv( "WINE_SOCK_SNDBUF_AUTOTUNE" )) && atoi( str );
+    return enabled;
+}
+
 static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 {
     struct sock *sock = get_fd_user( fd );
@@ -3422,6 +3431,16 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             return;
         }
 #endif
+
+        /* WINE_SOCK_SNDBUF_AUTOTUNE=1: remember the size but keep Linux send-buffer
+         * autotuning. Setting SO_SNDBUF turns autotuning off, and the Backblaze client asks
+         * for 64 KiB, which held each upload connection to about 5.5 Mbit/s at a 172 ms
+         * round trip. Windows tunes its send backlog itself whatever the app sets. */
+        if (is_tcp_socket( sock ) && sndbuf_autotune())
+        {
+            sock->sndbuf = sndbuf;
+            return;
+        }
 
         if (!setsockopt( unix_fd, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, sizeof(sndbuf) ))
             sock->sndbuf = sndbuf;
