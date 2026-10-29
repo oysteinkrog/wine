@@ -2130,7 +2130,7 @@ static struct
     WCHAR    *value;
     ULONGLONG time;
 } longpath_cache[LONGPATH_CACHE_SIZE];
-static SRWLOCK longpath_lock = SRWLOCK_INIT;
+static RTL_SRWLOCK longpath_lock = RTL_SRWLOCK_INIT;
 static int longpath_cache_enabled = -1;
 
 static unsigned int longpath_hash( const WCHAR *str, DWORD len )
@@ -2146,7 +2146,7 @@ static DWORD longpath_cache_get( const WCHAR *key, DWORD len, WCHAR *buf, DWORD 
     unsigned int i = longpath_hash( key, len );
     DWORD ret = 0, vlen;
 
-    AcquireSRWLockShared( &longpath_lock );
+    RtlAcquireSRWLockShared( &longpath_lock );
     if (longpath_cache[i].key && GetTickCount64() - longpath_cache[i].time < 1000 &&
         lstrlenW( longpath_cache[i].key ) == len && !memcmp( longpath_cache[i].key, key, len * sizeof(WCHAR) ) &&
         (vlen = lstrlenW( longpath_cache[i].value )) < buflen)
@@ -2154,7 +2154,7 @@ static DWORD longpath_cache_get( const WCHAR *key, DWORD len, WCHAR *buf, DWORD 
         memcpy( buf, longpath_cache[i].value, (vlen + 1) * sizeof(WCHAR) );
         ret = vlen;
     }
-    ReleaseSRWLockShared( &longpath_lock );
+    RtlReleaseSRWLockShared( &longpath_lock );
     return ret;
 }
 
@@ -2173,13 +2173,13 @@ static void longpath_cache_put( const WCHAR *key, DWORD len, const WCHAR *value,
     k[len] = 0;
     memcpy( v, value, vlen * sizeof(WCHAR) );
     v[vlen] = 0;
-    AcquireSRWLockExclusive( &longpath_lock );
+    RtlAcquireSRWLockExclusive( &longpath_lock );
     HeapFree( GetProcessHeap(), 0, longpath_cache[i].key );
     HeapFree( GetProcessHeap(), 0, longpath_cache[i].value );
     longpath_cache[i].key = k;
     longpath_cache[i].value = v;
     longpath_cache[i].time = GetTickCount64();
-    ReleaseSRWLockExclusive( &longpath_lock );
+    RtlReleaseSRWLockExclusive( &longpath_lock );
 }
 
 /***********************************************************************
