@@ -2647,6 +2647,74 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
 
 
 /***********************************************************************
+ *           image_shadow_enabled
+ *
+ * WINE_IMAGE_SHADOW=1: a PE section whose file offset is not page-aligned cannot be
+ * mmap()ed, so each process gets a private pread() copy of it. With this switch the
+ * section is written once to a page-aligned file under /dev/shm/wine-image-shadow-<uid>/,
+ * named after the image's device, inode, mtime, size and the section's offset and length,
+ * and every process maps that file copy-on-write instead, so the pages are shared. The
+ * Backblaze client starts a new bztransmit.exe for every upload batch, and its 4.5 MB
+ * .text and 1.4 MB .rdata sit at file offsets 0x400 and 0x475800.
+ */
+static BOOL image_shadow_enabled(void)
+{
+    static int enabled = -1;
+    const char *str;
+
+    if (enabled == -1) enabled = (str = getenv( "WINE_IMAGE_SHADOW" )) && atoi( str );
+    return enabled;
+}
+
+static int open_image_shadow( int fd, off_t offset, size_t size )
+{
+    struct stat st, dst;
+    char dir[64], path[192], tmp[224];
+    char *buf;
+    size_t done;
+    ssize_t ret;
+    int sfd;
+
+    if (fstat( fd, &st ) == -1) return -1;
+    snprintf( dir, sizeof(dir), "/dev/shm/wine-image-shadow-%u", (unsigned int)getuid() );
+    snprintf( path, sizeof(path), "%s/%llx-%llx-%llx.%09lu-%llx-%llx-%llx", dir,
+              (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+              (unsigned long long)st.st_mtim.tv_sec, (unsigned long)st.st_mtim.tv_nsec,
+              (unsigned long long)st.st_size, (unsigned long long)offset, (unsigned long long)size );
+
+    if ((sfd = open( path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW )) != -1)
+    {
+        if (!fstat( sfd, &dst ) && S_ISREG( dst.st_mode ) && dst.st_uid == getuid() &&
+            dst.st_size == size)
+            return sfd;
+        close( sfd );
+    }
+
+    if (mkdir( dir, 0700 ) == -1 && errno != EEXIST) return -1;
+    if (lstat( dir, &dst ) == -1 || !S_ISDIR( dst.st_mode ) || dst.st_uid != getuid() ||
+        (dst.st_mode & 077))
+        return -1;
+
+    snprintf( tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid() );
+    if ((sfd = open( tmp, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600 )) == -1)
+        return -1;
+    if (!(buf = calloc( 1, size ))) goto failed;
+    for (done = 0; done < size; done += ret)
+        if ((ret = pread( fd, buf + done, size - done, offset + done )) <= 0) break;
+    for (done = 0; done < size; done += ret)
+        if ((ret = write( sfd, buf + done, size - done )) <= 0) break;
+    free( buf );
+    if (done < size || rename( tmp, path ) == -1) goto failed;
+    return sfd;
+
+failed:
+    close( sfd );
+    unlink( tmp );
+    return -1;
+}
+
+
+/***********************************************************************
  *           map_image_into_view
  *
  * Map an executable (PE format) image into an existing view.
@@ -2793,6 +2861,22 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
          *       fall back to read(), so we don't need to check anything here.
          */
         end = file_start + file_size;
+        if (sec[i].PointerToRawData < st.st_size &&
+            end <= ((st.st_size + sector_align) & ~sector_align) &&
+            end >= file_start && !removable && (file_start & host_page_mask) &&
+            !(sec[i].VirtualAddress & host_page_mask) && image_shadow_enabled())
+        {
+            int sfd = open_image_shadow( fd, file_start, file_size );
+
+            if (sfd != -1)
+            {
+                NTSTATUS res = map_file_into_view( view, sfd, sec[i].VirtualAddress, file_size, 0,
+                                                   VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
+                                                   FALSE );
+                close( sfd );
+                if (res == STATUS_SUCCESS) goto mapped;
+            }
+        }
         if (sec[i].PointerToRawData >= st.st_size ||
             end > ((st.st_size + sector_align) & ~sector_align) ||
             end < file_start ||
@@ -2805,6 +2889,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             goto done;
         }
 
+    mapped:
         if (file_size & align_mask)
         {
             end = ROUND_SIZE( 0, file_size, align_mask );
