@@ -2705,7 +2705,24 @@ static int open_image_shadow( int fd, off_t offset, size_t size )
     for (done = 0; done < size; done += ret)
         if ((ret = write( sfd, buf + done, size - done )) <= 0) break;
     free( buf );
-    if (done < size || rename( tmp, path ) == -1) goto failed;
+    if (done < size) goto failed;
+    /* link() rather than rename(): when two processes race, the loser maps the winner's
+     * file instead of replacing it, so they still share pages */
+    if (link( tmp, path ) == -1)
+    {
+        close( sfd );
+        unlink( tmp );
+        if (errno != EEXIST) return -1;
+        if ((sfd = open( path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW )) == -1) return -1;
+        if (fstat( sfd, &dst ) || !S_ISREG( dst.st_mode ) || dst.st_uid != getuid() ||
+            dst.st_size != size)
+        {
+            close( sfd );
+            return -1;
+        }
+        return sfd;
+    }
+    unlink( tmp );
     return sfd;
 
 failed:
