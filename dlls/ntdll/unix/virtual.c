@@ -2653,7 +2653,8 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
  * mmap()ed, so each process gets a private pread() copy of it. With this switch the
  * section is written once to a page-aligned file under /dev/shm/wine-image-shadow-<uid>/,
  * named after the image's device, inode, mtime, size and the section's offset and length,
- * and every process maps that file copy-on-write instead, so the pages are shared. The
+ * and every process maps that file copy-on-write instead, so the pages are shared. Only
+ * sections of 64 KiB or more, where sharing is worth a file. The
  * Backblaze client starts a new bztransmit.exe for every upload batch, and its 4.5 MB
  * .text and 1.4 MB .rdata sit at file offsets 0x400 and 0x475800.
  */
@@ -2864,6 +2865,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[i].PointerToRawData < st.st_size &&
             end <= ((st.st_size + sector_align) & ~sector_align) &&
             end >= file_start && !removable && (file_start & host_page_mask) &&
+            file_size >= 0x10000 &&
             !(sec[i].VirtualAddress & host_page_mask) && image_shadow_enabled())
         {
             int sfd = open_image_shadow( fd, file_start, file_size );
